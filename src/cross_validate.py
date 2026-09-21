@@ -139,6 +139,23 @@ def run_cv(root: str = ".", n_splits: int = 5, verbose: bool = True) -> dict:
     df = pd.DataFrame(per_fold)
     df.to_csv("outputs/cv_per_fold.csv", index=False)
 
+    # Save the OOF prediction matrices, not just the summary metrics.
+    #
+    # Without these, every downstream question needs a full re-run: which models
+    # actually disagree (the Spearman that decides whether ensembling can help),
+    # whether a GBDT+transformer blend beats either alone, a patient-level
+    # bootstrap of a block effect. All of those are seconds of arithmetic on
+    # stored predictions and ~40 minutes of CPU without them.
+    #
+    # Each row is one example and each column one label, so this is the object
+    # every later comparison needs and none of them can reconstruct.
+    Path("artifacts").mkdir(exist_ok=True)
+    np.savez_compressed("artifacts/cv_oof_preds.npz",
+                        scored=scored, **{m: oof[m] for m in MODELS},
+                        **{f"{m}__rank": oof_rank[m] for m in MODELS})
+    print(f"  wrote artifacts/cv_oof_preds.npz "
+          f"({len(MODELS)} models x {int(scored.sum()):,} scored rows)", flush=True)
+
     # Each patient must be held out exactly once, or `bootstrap_macro`'s promise
     # to resample patients rather than rows is silently false.
     pid = lab["pid"] if "pid" in lab else None

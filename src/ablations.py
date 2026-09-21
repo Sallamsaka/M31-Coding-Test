@@ -10,7 +10,7 @@ when the headline claim is architectural.
 
 **The arms, and why there are six rather than the four originally planned.**
 
-| arm | mask | readout | Time2Vec | Δt bias | what it isolates |
+| arm | mask | readout | Time2Vec | dt bias | what it isolates |
 |---|---|---|---|---|---|
 | `full` | causal | last | on | on | the shipped model |
 | `no_dt_bias` | causal | last | on | **off** | graded distance |
@@ -196,7 +196,7 @@ def report(rows: list[dict]) -> None:
 
     print("\n  contrasts that answer the design claim:")
     for a, b, what in (
-        ("full", "no_dt_bias", "the Δt attention bias is worth"),
+        ("full", "no_dt_bias", "the dt attention bias is worth"),
         ("full", "no_time2vec", "the per-token Time2Vec is worth"),
         ("full", "no_time_signals", "both explicit time signals are worth"),
         ("bidir_mean", "multiset", "time within the order-blind shape is worth"),

@@ -379,7 +379,8 @@ def _ckpt_path(root, arm: str, seed: int, fingerprint: str = "") -> Path:
     return Path(root) / "artifacts" / f"ckpt_last_{arm}_seed{seed}{tag}.pt"
 
 
-def _config_fingerprint(cfg: "TrainConfig", arm: str, vocab_size: int) -> str:
+def _config_fingerprint(cfg: "TrainConfig", arm: str, vocab_size: int,
+                        block_size: int = 0) -> str:
     """What a resume must match. Resuming into a different architecture would
     load the wrong tensors; resuming into a different schedule would continue a
     cosine curve computed for a different horizon. Both fail silently, so the
@@ -390,7 +391,10 @@ def _config_fingerprint(cfg: "TrainConfig", arm: str, vocab_size: int) -> str:
             "batch_size", "warmup_frac", "seed", "dev_frac", "holdout_frac",
             "use_time_encoding", "use_dt_bias")
     blob = "|".join(f"{k}={getattr(cfg, k)}" for k in keys)
-    blob += f"|arm={arm}|vocab={vocab_size}"
+    # block_size too: the ctx256 ablation arm differs from `full` ONLY in it, so
+    # without it the two share a fingerprint -- hence a checkpoint slot and a run
+    # id. They were indistinguishable to the resume logic.
+    blob += f"|arm={arm}|vocab={vocab_size}|block={block_size}"
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -591,7 +595,7 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
     # different learning rates appeared as a single trajectory -- which makes
     # any per-run variance or convergence analysis meaningless. The fingerprint
     # already covers architecture, schedule, seed, arm and vocabulary.
-    fingerprint = _config_fingerprint(cfg, arm, len(vocab))
+    fingerprint = _config_fingerprint(cfg, arm, len(vocab), seq_cfg.block_size)
 
     run = wandb_shim.init(f"{arm}_seed{cfg.seed}_{fingerprint[:8]}",
                           {"arm": arm, **spec, **asdict(cfg),

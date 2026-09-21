@@ -83,7 +83,13 @@ def main(argv: list[str] | None = None) -> None:
     n_real = int(lab["is_real"].sum())
     val = F.split == "val"
     assert F.is_real[val].all(), "validation must never be augmented"
-    print(f"features {F.X.shape}  train {int((F.split=='train').sum()):,}  "
+    # Print the set actually FITTED, not the split size. They differ by the
+    # locked test set (2,791 vs 2,433), and printing the larger number is how a
+    # reader concludes the model trained on everything when it did not.
+    from .train_baseline import _fit_rows
+    n_fit = int(_fit_rows(F, None).sum())
+    print(f"features {F.X.shape}  fit {n_fit:,} "
+          f"(train {int((F.split=='train').sum()):,} minus the locked test set)  "
           f"val {int(val.sum())}  [{time.time()-t0:.0f}s]", flush=True)
 
     preds: dict[str, np.ndarray] = {}

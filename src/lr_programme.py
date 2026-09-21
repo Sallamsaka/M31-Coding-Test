@@ -54,8 +54,15 @@ BLOCKS = ("enable_reason", "enable_slope", "enable_time_since",
           "enable_cost", "enable_age_residual")
 
 
-def _score_one(root, fold_i, fit_rows, oof_rows, block_flags, dedup, C, windows=None):
-    """One (config, fold, C) cell. Returns a row dict."""
+def _score_one(root, fold_i, fit_rows, oof_rows, block_flags, dedup, cs,
+               windows=None):
+    """One (config, fold) cell swept over every C. Returns a LIST of row dicts.
+
+    C is swept inside the worker because `build_features` has no cache -- it
+    recomputes on every call -- and the feature matrix does not depend on C.
+    Taking C as a job axis instead rebuilt identical features once per C value,
+    which is 960 builds where 320 do, at ~3.6 s each.
+    """
     from .data.examples import ExampleConfig
     from .data.features import FeatureConfig, build_features
     from .data.labels import at_risk_mask, load_labels
@@ -63,20 +70,23 @@ def _score_one(root, fold_i, fit_rows, oof_rows, block_flags, dedup, C, windows=
     from .train_baseline import LRConfig, apply_at_risk_mask, fit_lr
 
     kw = dict(zip(BLOCKS, block_flags))
-    fcfg = FeatureConfig(deduplicate=dedup, **kw)
-    if windows is not None:
-        fcfg = FeatureConfig(deduplicate=dedup, windows=windows, **kw)
+    fcfg = (FeatureConfig(deduplicate=dedup, windows=windows, **kw)
+            if windows is not None else FeatureConfig(deduplicate=dedup, **kw))
     F = build_features(root, fcfg, ex_cfg=ExampleConfig(), fit_mask=fit_rows)
     lab = load_labels(root, ExampleConfig())
     y = lab["y"].astype(int)
     ar = at_risk_mask(lab)
-    P = fit_lr(F, y, ar, LRConfig(C=C), verbose=False, fit_mask=fit_rows)
-    P = apply_at_risk_mask(P, ar)
-    au, n_au = macro_auroc(y[oof_rows], P[oof_rows])
-    ap, _ = macro_ap(y[oof_rows], P[oof_rows])
-    return {"fold": fold_i, "dedup": dedup, "C": C, "n_cols": F.X.shape[1],
-            "auroc": au, "ap": ap, "n_scored": n_au,
-            **{b: f for b, f in zip(BLOCKS, block_flags)}}
+
+    out = []
+    for C in cs:
+        P = fit_lr(F, y, ar, LRConfig(C=C), verbose=False, fit_mask=fit_rows)
+        P = apply_at_risk_mask(P, ar)
+        au, n_au = macro_auroc(y[oof_rows], P[oof_rows])
+        ap, _ = macro_ap(y[oof_rows], P[oof_rows])
+        out.append({"fold": fold_i, "dedup": dedup, "C": C, "n_cols": F.X.shape[1],
+                    "auroc": au, "ap": ap, "n_scored": n_au,
+                    **{b: f for b, f in zip(BLOCKS, block_flags)}})
+    return out
 
 
 def run_factorial(root=".", quick=False) -> pd.DataFrame:
@@ -86,15 +96,17 @@ def run_factorial(root=".", quick=False) -> pd.DataFrame:
         [tuple(bool(int(b)) for b in f"{i:05b}") for i in range(32)]
     dedups = (False,) if quick else (False, True)
     cs = (0.03,) if quick else C_GRID
-    jobs = [(i, fit, oof, c, dd, C)
+    jobs = [(i, fit, oof, c, dd)
             for i, (fit, oof) in enumerate(folds)
-            for c in combos for dd in dedups for C in cs]
-    print(f"factorial: {len(jobs)} cells "
-          f"({len(combos)} block combos x {len(dedups)} dedup x {len(cs)} C x {len(folds)} folds)",
+            for c in combos for dd in dedups]
+    print(f"factorial: {len(jobs)} feature builds x {len(cs)} C "
+          f"= {len(jobs)*len(cs)} cells "
+          f"({len(combos)} block combos x {len(dedups)} dedup x {len(folds)} folds)",
           flush=True)
     t = time.time()
-    rows = Parallel(n_jobs=N_JOBS, backend="loky", verbose=5)(
-        delayed(_score_one)(root, i, fit, oof, c, dd, C) for i, fit, oof, c, dd, C in jobs)
+    nested = Parallel(n_jobs=N_JOBS, backend="loky", verbose=5)(
+        delayed(_score_one)(root, i, fit, oof, c, dd, cs) for i, fit, oof, c, dd in jobs)
+    rows = [r for group in nested for r in group]
     print(f"  {len(rows)} cells in {(time.time()-t)/60:.1f} min", flush=True)
     return pd.DataFrame(rows)
 

@@ -1,0 +1,116 @@
+# Single source of truth for every tunable.
+#
+# Evidence tags, used on every line that encodes a judgement:
+#   [M] measured on THIS dataset
+#   [D] derived from first principles
+#   [L] literature, at 10-1000x our scale -- transfer is an assumption
+#   [C] convention, with no number behind it
+#
+# The [C] lines are not hidden. Thirteen of them carry real choices, and the
+# report says so rather than implying everything was measured.
+
+seed: 0
+paths:
+  root: "."
+  artifacts: "artifacts"
+  outputs: "outputs"
+
+cohort:
+  anchor_years: 5
+  label_years: 5
+  label_right_closed: true          # [M] 119 first-diagnoses land exactly on anchor+5y
+  # [M] anchor floored to midnight: 0 of 358 test patients have an event on the
+  # anchor date while 11 have one in the preceding 24h, at hours 2-21.
+
+tables:
+  # [M] all ten are used. An earlier config called four of them "audit only";
+  # careplans reach 91% of patients for +0.82% sequence length, so that was
+  # leaving signal on the table for no saving.
+  all: [encounters, conditions, medications, procedures, observations,
+        immunizations, careplans, allergies, devices, imaging_studies]
+  # [M] 100% of these are stamped at exactly midnight, so they sort BEFORE the
+  # encounter that produced them -- 81.4% of conditions have a same-day
+  # encounter and every one of them landed early. Snapped onto it.
+  date_only_kinds: [COND, CP, ALG]
+
+forbidden:
+  # Refused at load time, not merely asserted about in a test.
+  patient_columns: [DEATHDATE, HEALTHCARE_EXPENSES, HEALTHCARE_COVERAGE]
+  # [M] DEATHDATE: 1354/3156 train_val, 0/358 test.
+  # [M] expenses are LIFETIME totals in both splits; a test patient's value is
+  #     ~512x their pre-anchor claims, so using it would RAISE the test score.
+  # [M] STOP-derived durations: 6,078 pre-anchor train meds stop after the
+  #     anchor, and test stops were blanked (4.41% null vs 1.17%).
+
+vocab:
+  min_patients_per_code: 5          # [M] drops 119 codes covering 0.075% of events
+  n_value_bins: 10                  # [C] measured sweeps of 10/20/30/100 differ <=0.011
+  fuse_value_min_events: 50         # [C] arbitrary, never tested
+
+sequence:
+  block_size: 512                   # [M] only 8.9% of real examples truncate here
+  truncate: recent                  # [M] the 10y+ tail has the lowest signal per event
+  bucketed_batching: true           # [M] 2.64x faster: 4,504 vs 11,895 ms/step
+
+features:
+  windows_days: [365, 1825, null]   # [M] nested cumulative; signal rises with depth
+  lab_min_coverage: 0.05            # [M] 49 labs; coverage collapses past the 49th
+  n_time_since_common: 20
+  enable_reason: true               # [M] 109 reasons, 33/40 targets covered
+  enable_slope: true
+  enable_time_since: true
+  enable_cost: true
+  enable_age_residual: true
+  # [M] measured: all five blocks are within +-0.005 on LR, i.e. below the
+  # noise floor. Kept because two of them (reason, age_residual) can only pay
+  # off through interactions that LR cannot express.
+
+examples:
+  augment: false                    # [M] OFF -- see below
+  stride_years: 5
+  min_events: 10
+  # [M] Cutoff augmentation was expected to be the largest lever and is not.
+  # Naive pooling costs 0.009 macro AUROC at stride 5, with C retuned per arm.
+  # The 2x2 diagnostic shows why: trained on synthetic examples, val AUROC is
+  # 0.7548 on SYNTHETIC validation but 0.6772 on real -- the examples are fine,
+  # the distribution differs. Machinery kept behind the flag.
+
+baseline:
+  lr_C: 0.03                        # [M] best of {0.001..0.3} on a real-only fit
+  gbdt:
+    learning_rate: 0.05
+    max_iter: 300
+    max_leaf_nodes: 15
+    min_samples_leaf: 5             # [M] NOT 20 -- that is 69% of the rarest positive class
+    l2_regularization: 1.0          # sklearn's default is 0.0
+    early_stopping: false           # [D] 'auto' is silently OFF below n=10000
+  class_weight: null                # [L] reweighting: AUROC never higher, calibration ruined
+
+transformer:
+  n_layer: 4                        # [C] + [L] Delphi-2M is 2.2M params on disease timelines
+  n_embd: 192                       # [C]
+  n_head: 6                         # [C]
+  d_time: 64                        # [D] Time2Vec, linear term + 63 sinusoids
+  n_dt_buckets: 32                  # [C] arbitrary
+  max_dt_days: 40000                # [M] the largest observed dt is 37,284
+  epochs: 20
+  batch_size: 32                    # [C]
+  lr: 6.0e-4                        # [C] nanoGPT default
+  weight_decay: 0.1                 # [C]
+  grad_clip: 1.0                    # [C]
+  attn_dropout: 0.1                 # [L] DropKey: 5x larger gain at small n
+  # The four coherent arms. Readout follows the mask and the pretraining
+  # objective follows the mask, so these are the only consistent combinations.
+  arms:
+    P1: {causal: true,  readout: last, pretrain: lm}
+    P2: {causal: false, readout: mean, pretrain: mlm}
+    P3: {causal: false, readout: mean, pretrain: null}
+    P4: {causal: true,  readout: last, pretrain: null}
+
+eval:
+  bootstrap_n: 500
+  drop_degenerate_replicates: true
+  at_risk_mask: true                # [M] +0.035 macro AUROC, the largest single gain
+  report_both_denominators: true    # [M] 0.7683 all vs 0.7390 at-risk
+  # [M] resolution limit of this validation set is about +-0.01 macro AUROC.
+  # Anything smaller is reported as "not resolvable", never as a ranking.

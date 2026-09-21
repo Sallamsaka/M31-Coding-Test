@@ -1,0 +1,34 @@
+# Data -- never commit (imaging alone is 9.2 GB, and it is not ours to publish)
+train_val/
+test/
+genomics/
+imaging/
+patient_splits.csv
+target_conditions.csv
+test_anchors.csv
+
+# Caches and run outputs.
+#
+# NOTE the trailing /* rather than /. Git cannot re-include a file inside an
+# EXCLUDED DIRECTORY -- it never descends into it, so a later "!" line is dead.
+# Writing `outputs/` here would silently keep predictions.csv out of the repo,
+# and predictions.csv is a required deliverable.
+artifacts/*
+outputs/*
+wandb/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ...which makes these re-includes actually work
+!artifacts/vocab.json
+!outputs/predictions.csv
+!outputs/predictions_meta.json
+!outputs/per_code_val.csv
+!outputs/figures/
+
+
+# Model weights are a build artifact and go to the Hub, not into git history.
+# Regenerate with `python -m src.run_baseline`; a test checks the reloaded
+# bundle reproduces predictions.csv exactly.

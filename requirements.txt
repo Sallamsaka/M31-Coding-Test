@@ -1,0 +1,13 @@
+# pinned at the versions this was developed and verified against
+torch==2.9.1
+pandas==2.3.3
+numpy==2.4.0
+scikit-learn>=1.5
+pyarrow>=17
+matplotlib==3.10.8
+pyyaml==6.0.3
+tqdm==4.67.1
+wandb>=0.18
+huggingface_hub==1.2.3
+pytest>=8
+joblib>=1.4

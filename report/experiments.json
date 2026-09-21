@@ -1,0 +1,351 @@
+{
+  "_provenance": "Measured results from experiments run outside the main pipeline. Each entry names the script that produced it so the number can be regenerated rather than trusted. Validation set is the 365 real val patients throughout unless stated.",
+  "learning_curve_real_only": {
+    "_script": "scratchpad/learning_curve.py, Q1",
+    "_note": "LR, C retuned at every point, patients subsampled by patient id. Still rising at the right-hand edge, so the task is not saturated at 2,791.",
+    "n_patients": [
+      350,
+      700,
+      1400,
+      2100,
+      2791
+    ],
+    "macro_auroc": [
+      0.733,
+      0.7292,
+      0.7498,
+      0.7576,
+      0.7679
+    ],
+    "macro_ap": [
+      0.1928,
+      0.2117,
+      0.2205,
+      0.2385,
+      0.2376
+    ]
+  },
+  "domain_shift_2x2": {
+    "_script": "scratchpad/two_by_two.py",
+    "_note": "Synthetic validation examples are a DIAGNOSTIC only and were never used for model selection. Each training distribution scores highest on its own evaluation distribution; both cross terms collapse.",
+    "rows": [
+      {
+        "train": "real n=2791",
+        "eval_real": 0.7679,
+        "eval_synth": 0.6345
+      },
+      {
+        "train": "synthetic n=2791",
+        "eval_real": 0.6772,
+        "eval_synth": 0.7548
+      },
+      {
+        "train": "synthetic n=12864",
+        "eval_real": 0.6942,
+        "eval_synth": 0.7655
+      }
+    ]
+  },
+  "augmentation_stride_sweep": {
+    "_script": "scratchpad/aug_cgrid.py + overnight_aug.py part A",
+    "_note": "C retuned per arm over {0.001 ... 3.0}; the value shown is each arm's own optimum, so this is not a regularisation artifact.",
+    "arms": [
+      {
+        "arm": "no augmentation",
+        "n_train": 2791,
+        "best_C": 0.03,
+        "macro_auroc": 0.7683,
+        "macro_ap": 0.2374
+      },
+      {
+        "arm": "stride 5y",
+        "n_train": 15655,
+        "best_C": 0.3,
+        "macro_auroc": 0.7593,
+        "macro_ap": 0.2318
+      },
+      {
+        "arm": "stride 3y",
+        "n_train": 25552,
+        "best_C": 0.1,
+        "macro_auroc": 0.7567,
+        "macro_ap": 0.2311
+      }
+    ]
+  },
+  "feature_block_screen": {
+    "_script": "scratchpad/block_screen.py",
+    "_note": "All arms lie within 0.0046 of each other, against a noise floor of about 0.01. Nothing here is measurable on LR. REASONCODE and age-residual can only pay off through interactions LR cannot express, so a null here is not a null for trees.",
+    "arms": [
+      {
+        "arm": "no lab block",
+        "dims": 2781,
+        "macro_auroc": 0.7703,
+        "macro_ap": 0.2408
+      },
+      {
+        "arm": "lab coverage 49",
+        "dims": 2879,
+        "macro_auroc": 0.766,
+        "macro_ap": 0.236
+      },
+      {
+        "arm": "+ REASONCODE",
+        "dims": 3194,
+        "macro_auroc": 0.7659,
+        "macro_ap": 0.2386
+      },
+      {
+        "arm": "+ lab slope",
+        "dims": 2928,
+        "macro_auroc": 0.7658,
+        "macro_ap": 0.2349
+      },
+      {
+        "arm": "+ time since code",
+        "dims": 2937,
+        "macro_auroc": 0.7668,
+        "macro_ap": 0.2364
+      },
+      {
+        "arm": "+ cost",
+        "dims": 2885,
+        "macro_auroc": 0.7658,
+        "macro_ap": 0.2369
+      },
+      {
+        "arm": "+ age residual",
+        "dims": 2892,
+        "macro_auroc": 0.7657,
+        "macro_ap": 0.2359
+      },
+      {
+        "arm": "all blocks",
+        "dims": 3320,
+        "macro_auroc": 0.7666,
+        "macro_ap": 0.2368
+      }
+    ]
+  },
+  "synthetic_population_shift": {
+    "_script": "scratchpad/age.py, mk.py, verify_synth.py",
+    "median_age_real": 64.3,
+    "median_age_synthetic": 50.2,
+    "median_pre_cutoff_events_real": 189,
+    "median_pre_cutoff_events_synthetic": 26,
+    "positive_rate_real": 0.0467,
+    "positive_rate_synthetic": 0.0126,
+    "label_mismatches_vs_raw_csv": 0,
+    "monotonicity_violations": 0
+  },
+  "anchor_selection": {
+    "_script": "src/diagnostics.py",
+    "train_val_patients": 3156,
+    "with_death_date": 1354,
+    "share_with_death_date": 0.429,
+    "deaths_within_30d_of_window_end": 1.0,
+    "median_death_minus_window_end_days": -7,
+    "windows_shorter_than_5y": 0
+  },
+  "bucketing_speedup": {
+    "_script": "inline timing probe, 12 steps each, 8 threads",
+    "ms_per_step_bucketed": 4504,
+    "ms_per_step_fixed_512": 11895,
+    "speedup": 2.64
+  },
+  "transformer_arms": {
+    "_script": "scratchpad/run_arms.py -> src.train_finetune.train",
+    "_note": "20 epochs, batch 32, length-bucketed, best epoch chosen by validation macro AP. NOTE when re-reading metrics.jsonl: it accumulates across runs, including smoke runs, so filter on step % steps_per_epoch == 0 before numbering epochs -- a leftover 30-step smoke record initially shifted every epoch index by one.",
+    "P4_causal_last_token": {
+      "best_epoch": 14,
+      "macro_auroc": 0.7557,
+      "macro_ap": 0.186,
+      "final_epoch_auroc": 0.7533,
+      "final_epoch_ap": 0.1847,
+      "last5_auroc": [
+        0.7522,
+        0.7534,
+        0.7548,
+        0.7532,
+        0.7533
+      ],
+      "minutes": 126,
+      "epochs": 20,
+      "last5_ap": [
+        0.1826,
+        0.1853,
+        0.1855,
+        0.185,
+        0.1847
+      ]
+    },
+    "P3_bidirectional_mean_pool": {
+      "best_epoch": 10,
+      "epochs": 20,
+      "macro_auroc": 0.7409,
+      "macro_ap": 0.1832,
+      "peak_auroc": 0.746,
+      "peak_auroc_epoch": 11,
+      "final_epoch_auroc": 0.7387,
+      "final_epoch_ap": 0.1762,
+      "_note": "Leads P4 on AP through epochs 3-10 (0.1778 vs 0.1358 at epoch 6), peaks at epoch 11, then declines -- more expressive per step, overfitting sooner at 2,791 patients."
+    },
+    "P1_causal_pretrained": "implemented and smoke-verified, not trained",
+    "P2_bidirectional_pretrained": "implemented and smoke-verified, not trained",
+    "comparison_to_lr": {
+      "lr_macro_auroc": 0.7666,
+      "lr_macro_ap": 0.2368,
+      "auroc_gap": 0.0109,
+      "ap_gap": 0.0508,
+      "resolution_limit": 0.01,
+      "verdict": "AUROC gap is inside the resolution limit and inside the +0.038 winner's-curse bound, so not distinguishable. The AP gap is not explainable that way."
+    },
+    "final_comparison": {
+      "_script": "src/compare.py --n-boot 500",
+      "table": [
+        {
+          "model": "ensemble (LR+P4)",
+          "macro_auroc": 0.7727,
+          "macro_ap": 0.2356
+        },
+        {
+          "model": "lr",
+          "macro_auroc": 0.7666,
+          "macro_ap": 0.2368
+        },
+        {
+          "model": "P4_causal",
+          "macro_auroc": 0.7557,
+          "macro_ap": 0.186
+        },
+        {
+          "model": "P3_bidirectional",
+          "macro_auroc": 0.7409,
+          "macro_ap": 0.1832
+        },
+        {
+          "model": "mask_only",
+          "macro_auroc": 0.5498,
+          "macro_ap": 0.0572
+        }
+      ],
+      "paired_bootstrap_auroc": {
+        "ensemble_minus_lr": [
+          0.0061,
+          -0.0057,
+          0.0177
+        ],
+        "lr_minus_P4": [
+          0.0109,
+          -0.0098,
+          0.0336
+        ],
+        "P4_minus_P3": [
+          0.0148,
+          -0.0033,
+          0.0318
+        ],
+        "_all_verdicts": "not resolvable"
+      },
+      "spearman_per_label_median": {
+        "lr_vs_P4": 0.436,
+        "lr_vs_gbdt": 0.74
+      },
+      "selected": "lr",
+      "selection_reason": "ensemble and lr are not resolvable on macro AP, so the pre-registered rule takes the simpler model. The ensemble has the higher AUROC but the rule ranks on AP and was fixed before the numbers existed."
+    }
+  },
+  "transformer_search": {
+    "_script": "src/search.py --stage all",
+    "_note": "Scored on an inner 20% dev split of TRAIN; provided validation not read. Epoch budget is a ceiling of 45 with patience 7, after a fixed 20-epoch cap was found to invert conclusions. Stage E, the interaction re-test, WON -- the greedy path's depth choice did not survive the later choices. Single seed: confirm.py not yet run.",
+    "configs": [
+      {
+        "tag": "A n_layer=1 drop=0.1",
+        "dev_macro_ap": 0.1796,
+        "dev_macro_auroc": 0.7429,
+        "best_epoch": 19,
+        "epochs_run": 26
+      },
+      {
+        "tag": "A n_layer=1 drop=0.3",
+        "dev_macro_ap": 0.1692,
+        "dev_macro_auroc": 0.7402,
+        "best_epoch": 11,
+        "epochs_run": 18
+      },
+      {
+        "tag": "A n_layer=2 drop=0.1",
+        "dev_macro_ap": 0.1752,
+        "dev_macro_auroc": 0.7395,
+        "best_epoch": 20,
+        "epochs_run": 27
+      },
+      {
+        "tag": "A n_layer=2 drop=0.3",
+        "dev_macro_ap": 0.1702,
+        "dev_macro_auroc": 0.7294,
+        "best_epoch": 16,
+        "epochs_run": 23
+      },
+      {
+        "tag": "A n_layer=4 drop=0.1",
+        "dev_macro_ap": 0.1643,
+        "dev_macro_auroc": 0.7442,
+        "best_epoch": 14,
+        "epochs_run": 21
+      },
+      {
+        "tag": "A n_layer=4 drop=0.3",
+        "dev_macro_ap": 0.1726,
+        "dev_macro_auroc": 0.7358,
+        "best_epoch": 32,
+        "epochs_run": 39
+      },
+      {
+        "tag": "B n_embd=96",
+        "dev_macro_ap": 0.1754,
+        "dev_macro_auroc": 0.7452,
+        "best_epoch": 18,
+        "epochs_run": 25
+      },
+      {
+        "tag": "B n_embd=192",
+        "dev_macro_ap": 0.1908,
+        "dev_macro_auroc": 0.74,
+        "best_epoch": 19,
+        "epochs_run": 26
+      },
+      {
+        "tag": "C fusion=readout",
+        "dev_macro_ap": 0.2042,
+        "dev_macro_auroc": 0.7545,
+        "best_epoch": 19,
+        "epochs_run": 26
+      },
+      {
+        "tag": "C fusion=token",
+        "dev_macro_ap": 0.2022,
+        "dev_macro_auroc": 0.7315,
+        "best_epoch": 10,
+        "epochs_run": 17
+      },
+      {
+        "tag": "D pretrain=lm",
+        "dev_macro_ap": 0.1854,
+        "dev_macro_auroc": 0.7577,
+        "best_epoch": 14,
+        "epochs_run": 21
+      },
+      {
+        "tag": "E n_layer=2 @ final",
+        "dev_macro_ap": 0.2144,
+        "dev_macro_auroc": 0.7591,
+        "best_epoch": 13,
+        "epochs_run": 20
+      }
+    ],
+    "winner": "E n_layer=2 @ final (2 layers, width 192, readout fusion)",
+    "spread_ap": 0.0501,
+    "spread_auroc": 0.0297
+  }
+}

@@ -77,9 +77,10 @@ def paired_effects(df: pd.DataFrame, factors: list[str], metric: str,
             continue
         eff = float(d.mean())
         se = float(d.std(ddof=1) / np.sqrt(n))
-        t = eff / se if se > 0 else np.nan
-        # One-sided: H1 is "the high level is better".
-        p = float(stats.t.sf(t, df=n - 1)) if se > 0 else np.nan
+        # NOTE: no t or p from these n pairs. An earlier version computed one
+        # with df = n_pairs - 1, which is the WRONG reference distribution --
+        # the pairs are not the replication unit (E17). The reported p uses the
+        # fold-based SE and df below.
         # Diagnostic only -- see the module docstring on why this is not the SE.
         per_fold = df.groupby([fold_col] + cfg_cols, dropna=False)[metric].mean().reset_index()
         pf = []

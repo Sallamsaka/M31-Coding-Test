@@ -602,6 +602,7 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
         # value, so the single most diagnostic number in the loop was being
         # thrown away every step.
         gn_sum, gn_max, n_clipped = 0.0, 0.0, 0
+        upd_norm = float("nan")
         for rows in bucketed_batches(pack.lengths, tr, cfg.batch_size, rng):
             lr = cfg.lr * (step / warm if step < warm else
                            0.5 * (1 + math.cos(math.pi * (step - warm) /
@@ -631,7 +632,17 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
             gn_sum += gnorm
             gn_max = max(gn_max, gnorm)
             n_clipped += int(gnorm > cfg.grad_clip)
+            # Once per epoch, measure the REAL update norm by snapshotting around
+            # one step. lr*||g||/||w|| is the SGD update and is wrong for Adam,
+            # whose step is lr*m/(sqrt(v)+eps) -- about lr per COORDINATE, so
+            # ||dw|| ~ lr*sqrt(n), not lr*||g||. The SGD form understated the
+            # ratio by ~6,000x and made a healthy 7.5e-3 look like 1.2e-6.
+            _snap = ([q.detach().clone() for q in model.parameters()]
+                     if nb == 0 else None)
             opt.step()
+            if _snap is not None:
+                upd_norm = float(sum(float((q.detach() - o).norm()) ** 2
+                                     for q, o in zip(model.parameters(), _snap)) ** 0.5)
             tot += float(loss); nb += 1; step += 1
 
             if step == 20 and verbose:
@@ -682,7 +693,8 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
                      "grad_norm_max": gn_max,
                      "clip_frac": n_clipped / max(nb, 1),
                      "param_norm": pnorm,
-                     "update_param_ratio": lr * (gn_sum / max(nb, 1)) / max(pnorm, 1e-12),
+                     "update_norm": upd_norm,
+                     "update_param_ratio": upd_norm / max(pnorm, 1e-12),
                      "ema_macro_auroc": ema_au, "ema_macro_ap": ema_ap,
                      "minutes": (time.time() - t0) / 60}, step=step)
             # A band, not a bare ">": without it a 1e-6 wobble resets

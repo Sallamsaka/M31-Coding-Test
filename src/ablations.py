@@ -74,6 +74,28 @@ BASE = dict(n_layer=2, n_embd=128, n_head=4, epochs=30, patience=4,
             eval_on="dev", seed=0)
 
 ARMS: dict[str, dict] = {
+    # `block_size` is a SeqConfig field, not a TrainConfig one; run_arm pulls it
+    # out and builds the sequence pack with it.
+    #
+    # ctx256 tests the PREMISE behind the event-vs-day question rather than
+    # building the fix for it. Truncation keeps the most recent tokens, so at
+    # block 512 we discard 32.2% of all events -- the OLDEST history of the
+    # LONGEST records, i.e. the most comorbid patients. Day-pooling would
+    # recover that (5.05x compression), but it is a real modelling change, and
+    # it is only worth building if the discarded history matters.
+    #
+    # Halving the window is strictly CHEAPER than the baseline and bounds the
+    # answer monotonically: if 256 ~ 512, older context has sharply diminishing
+    # value, 512 -> more would buy little, and day-pooling can be dropped on
+    # MEASURED grounds instead of on a literature argument. If 256 << 512, the
+    # 32% we are throwing away probably matters and day-pooling (or a larger
+    # block) earns its implementation cost.
+    #
+    # Deliberately testing downward: at block 1024 the attention bias tensor is
+    # (B, n_head, T, T) = 1.2 GB at batch 32, against a measured ~2 GB safe
+    # budget on this machine (V10). Upward needs token-budget batching first.
+    "ctx256":          dict(arm="P4", use_time_encoding=True,  use_dt_bias=True,
+                            block_size=256),
     "full":            dict(arm="P4", use_time_encoding=True,  use_dt_bias=True),
     "no_dt_bias":      dict(arm="P4", use_time_encoding=True,  use_dt_bias=False),
     "no_time2vec":     dict(arm="P4", use_time_encoding=False, use_dt_bias=True),
@@ -90,10 +112,13 @@ def run_arm(name: str, root: str = ".", verbose: bool = True) -> dict:
 
     spec = dict(ARMS[name])
     arm = spec.pop("arm")
+    block = spec.pop("block_size", None)
+    seq_cfg = SeqConfig(block_size=block) if block else SeqConfig()
     cfg = TrainConfig(**BASE, **spec)
     t0 = time.time()
-    r = train(arm, root, cfg, ExampleConfig(), SeqConfig(), verbose=False)
-    out = {"ablation": name, "base_arm": arm, **spec,
+    r = train(arm, root, cfg, ExampleConfig(), seq_cfg, verbose=False)
+    out = {"ablation": name, "base_arm": arm, "block_size": seq_cfg.block_size,
+           **spec,
            "macro_auroc": r["macro_auroc"], "macro_ap": r["macro_ap"],
            "hold_macro_auroc": r.get("holdout_macro_auroc", float("nan")),
            "hold_macro_ap": r.get("holdout_macro_ap", float("nan")),
@@ -160,6 +185,7 @@ def report(rows: list[dict]) -> None:
         ("full", "no_time_signals", "both explicit time signals are worth"),
         ("bidir_mean", "multiset", "time within the order-blind shape is worth"),
         ("full", "multiset", "the whole time apparatus is worth"),
+        ("full", "ctx256", "doubling the context window 256->512 is worth"),
     ):
         g = gap(a, b)
         if g is None:

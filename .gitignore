@@ -40,3 +40,4 @@ run_lr_chain.sh
 run_tx_chain.sh
 
 run_design_chain.sh
+run_overnight.sh

@@ -32,3 +32,9 @@ __pycache__/
 # Model weights are a build artifact and go to the Hub, not into git history.
 # Regenerate with `python -m src.run_baseline`; a test checks the reloaded
 # bundle reproduces predictions.csv exactly.
+
+# Overnight run orchestration. Session-local: they hardcode an absolute path and
+# only sequence modules that ARE in the repo, so they are a record of the run
+# order rather than part of the pipeline.
+run_lr_chain.sh
+run_tx_chain.sh

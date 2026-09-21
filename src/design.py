@@ -286,6 +286,17 @@ def run_design(root=".", arm="P4", verbose=True):
     basin_lr = float(basin["basin_lr"])
     runs = design_runs(basin_lr)
 
+    # RANDOMISE THE RUN ORDER. Standard DOE practice against time trends, but
+    # the binding reason here is cruder: this is an ~8-hour serial job on a
+    # laptop. In design-matrix order the first 8 runs are ALL lr-low, so a crash
+    # or an interrupt at run 10 leaves a set with no lr-high runs at all and the
+    # lr contrast is unestimable. Randomised, any prefix is roughly balanced in
+    # every factor, so a partial design still yields usable (wider) effects --
+    # and design_runs.csv is written after every run precisely so a prefix is
+    # worth having.
+    order = np.random.default_rng(20250921).permutation(len(runs))
+    runs = [runs[i] for i in order]
+
     print("design: %d runs (16 corners + 4 centre), basin lr = %.1e"
           % (len(runs), basin_lr), flush=True)
     if sig:

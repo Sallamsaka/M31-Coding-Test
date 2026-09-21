@@ -127,6 +127,15 @@ def run_arm(name: str, root: str = ".", verbose: bool = True) -> dict:
         print(f"  {name:<17} AUROC {out['macro_auroc']:.4f}  AP {out['macro_ap']:.4f}"
               f"  ep{out['epoch']:<3} [{out['minutes']:.1f} min]", flush=True)
     LEDGER.parent.mkdir(exist_ok=True)
+    # Keep the PREDICTIONS, not just the three summary numbers. Each arm
+    # costs 15-40 min; the score is recoverable from the predictions but
+    # nothing is recoverable from the score. Everything downstream -- which
+    # arms disagree, whether two ensemble well, a patient-level bootstrap of
+    # a contrast, per-label breakdowns -- needs this array and cannot
+    # reconstruct it.
+    if r.get("preds") is not None:
+        Path("artifacts").mkdir(exist_ok=True)
+        np.save(f"artifacts/ablation_preds_{name}.npy", r["preds"])
     with LEDGER.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(out) + "\n")
     return out

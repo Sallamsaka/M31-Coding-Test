@@ -365,8 +365,18 @@ class WeightEMA:
         return dict(self.state)
 
 
-def _ckpt_path(root, arm: str, seed: int) -> Path:
-    return Path(root) / "artifacts" / f"ckpt_last_{arm}_seed{seed}.pt"
+def _ckpt_path(root, arm: str, seed: int, fingerprint: str = "") -> Path:
+    """Keyed by CONFIGURATION, not just arm and seed.
+
+    The basin sweep runs five learning rates as arm=P4, seed=0, so under the old
+    name they shared one checkpoint file. The fingerprint check meant a wrong
+    resume was refused rather than silently accepted -- but the refusing run then
+    OVERWROTE the file, so a genuinely crashed run could never resume once a
+    sibling configuration had started. Including the fingerprint gives each
+    configuration its own slot.
+    """
+    tag = f"_{fingerprint[:8]}" if fingerprint else ""
+    return Path(root) / "artifacts" / f"ckpt_last_{arm}_seed{seed}{tag}.pt"
 
 
 def _config_fingerprint(cfg: "TrainConfig", arm: str, vocab_size: int) -> str:
@@ -575,8 +585,17 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
                  epochs=cfg.pretrain_epochs, verbose=verbose,
                  max_steps=(5 if max_steps is not None else None))
 
-    run = wandb_shim.init(f"{arm}_seed{cfg.seed}",
+    # The run id must distinguish CONFIGURATIONS, not just arm and seed. All
+    # five learning-rate points of the basin sweep run as arm=P4, seed=0, so
+    # under the old name they logged as one run and 220 epochs of five
+    # different learning rates appeared as a single trajectory -- which makes
+    # any per-run variance or convergence analysis meaningless. The fingerprint
+    # already covers architecture, schedule, seed, arm and vocabulary.
+    fingerprint = _config_fingerprint(cfg, arm, len(vocab))
+
+    run = wandb_shim.init(f"{arm}_seed{cfg.seed}_{fingerprint[:8]}",
                           {"arm": arm, **spec, **asdict(cfg),
+                           "fingerprint": fingerprint,
                            "n_train": len(tr), "vocab": len(vocab)})
 
     Y = torch.from_numpy(y)
@@ -586,8 +605,7 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
     # the average is never a view onto live parameters.
     ema = WeightEMA(cfg.ema_decay)
 
-    fingerprint = _config_fingerprint(cfg, arm, len(vocab))
-    ckpt = _ckpt_path(root, arm, cfg.seed)
+    ckpt = _ckpt_path(root, arm, cfg.seed, fingerprint)
     start_epoch, step, best = 0, 0, {"macro_ap": -1.0}
     if cfg.resume and max_steps is None:
         start_epoch, step, best = _try_resume(

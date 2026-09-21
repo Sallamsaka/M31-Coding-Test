@@ -145,9 +145,14 @@ def test_min_delta_default_preserves_the_original_behaviour():
     assert TrainConfig().min_delta == 0.0
 
 
-def test_ckpt_path_is_keyed_by_arm_and_seed():
-    a = _ckpt_path(".", "P4", 0)
-    assert a != _ckpt_path(".", "P3", 0) and a != _ckpt_path(".", "P4", 1)
+def test_ckpt_path_is_keyed_by_configuration_not_just_arm_and_seed():
+    """The basin sweep runs five learning rates at arm=P4, seed=0. Under the old
+    key they shared one checkpoint file, so a crashed run could never resume
+    once a sibling configuration had overwritten it."""
+    a = _ckpt_path(".", "P4", 0, "aaaaaaaa")
+    assert a != _ckpt_path(".", "P3", 0, "aaaaaaaa")
+    assert a != _ckpt_path(".", "P4", 1, "aaaaaaaa")
+    assert a != _ckpt_path(".", "P4", 0, "bbbbbbbb"), "same arm+seed, different config"
 
 
 # --------------------------------------------------------------------------

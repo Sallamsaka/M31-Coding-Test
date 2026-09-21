@@ -205,12 +205,18 @@ def report_cv(res: dict, verbose: bool = True) -> None:
                  ("gbdt", "trivial"), ("trivial", "prevalence")):
         d = paired_bootstrap_delta(y[rows], res["oof"][a][rows],
                                    res["oof"][b][rows])
-        pt, lo, hi, _sd = d["d_macro_ap"]      # (point, lo, hi, sd)
-        pg = d.get("p_a_gt_b_ap")
-        tag = "resolvable" if (lo > 0 or hi < 0) else "not resolvable"
-        extra = f"  P({a}>{b}) = {pg:.2f}" if pg is not None else ""
-        print(f"  {a:>10} - {b:<12} dAP {pt:+.4f} [{lo:+.4f}, {hi:+.4f}]"
-              f"  {tag}{extra}")
+        # BOTH metrics. paired_bootstrap_delta computes the AUROC delta too and
+        # an earlier version printed only AP, discarding it -- which mattered,
+        # because macro AP is the pre-registered primary but the ensemble result
+        # in B was an AUROC finding.
+        for metric in ("ap", "auroc"):
+            pt, lo, hi, _sd = d[f"d_macro_{metric}"]
+            pg = d.get(f"p_a_gt_b_{metric}")
+            tag = "resolvable" if (lo > 0 or hi < 0) else "not resolvable"
+            extra = f"  P({a}>{b}) = {pg:.2f}" if pg is not None else ""
+            lbl = "dAP   " if metric == "ap" else "dAUROC"
+            print(f"  {a:>10} - {b:<12} {lbl} {pt:+.4f} [{lo:+.4f}, {hi:+.4f}]"
+                  f"  {tag}{extra}")
     print("\n  P(A>B) is reported beside every interval on purpose: a"
           " significance gate\n  alone false-negatives ~90% of the time at this"
           " resolution (Bouthillier\n  et al. 2021), against ~30% for P(A>B).")

@@ -18,10 +18,24 @@ thread scheduling, which depends on machine load -- and load differed sharply
 between the two attempts. That predicts OCCASIONAL divergence, which fits the
 pattern, but it is a hypothesis until it is measured.
 
-Why it matters beyond tidiness: if the same seed does not give the same result,
-then the seed sigma of 0.0063 is not seed variance -- it is seed variance PLUS
-run-to-run non-determinism, and every MDE computed from it is wrong. It also
-means a resumed run cannot be verified against an unresumed one.
+**What this does NOT invalidate.** An earlier version of this note claimed the
+measured sigma of 0.0063 would be "wrong" if runs are non-deterministic. That is
+incorrect. The design compares configurations, each measured by one training
+run, so the noise it must be sized against is TOTAL run-to-run variance --
+sigma^2 = sigma_seed^2 + sigma_nondeterminism^2 -- and five repeats measure
+exactly that sum. The decomposition is irrelevant to the MDE, and the MDE stands.
+Variance between runs is normal and the right response is to measure it, which
+is Bouthillier et al.'s position and what E18 already did.
+
+**What it does affect**, which is narrower:
+
+  * the claim "run this with seed 0 and you get X" -- simply false if it holds;
+  * verifying that a RESUMED run matches an unresumed one, which is the whole
+    premise of the checkpoint tests;
+  * attributing a difference to a code change. This one has real cost: when
+    `full` moved 0.1889 -> 0.2006 there was no way to tell whether the EMA code
+    had altered training or the machine had merely scheduled threads
+    differently. That is a debugging problem, not a statistical one.
 
 The test runs the same tiny configuration twice under identical settings, then
 again with a single thread, and compares the weights bitwise. One thread is the
@@ -74,9 +88,10 @@ def main(root: str = ".") -> None:
         print("  divergence is NOT thread non-determinism; look elsewhere.")
     elif ok1 and not ok8:
         print("  VERDICT: 8 threads diverge, 1 thread does not. Parallel float")
-        print("  reduction order is the cause. `threads` is a REPRODUCIBILITY")
-        print("  setting, not only a speed one, and the measured seed sigma of")
-        print("  0.0063 conflates seed variance with run-to-run noise.")
+        print("  reduction order is the cause. `threads` becomes a")
+        print("  REPRODUCIBILITY setting, not only a speed one. Note this does")
+        print("  NOT invalidate the measured sigma: the design needs total")
+        print("  run-to-run variance and five repeats already measure it.")
     else:
         print("  VERDICT: diverges even single-threaded -- the cause is upstream")
         print("  of threading (data order, an unseeded generator, or state that")

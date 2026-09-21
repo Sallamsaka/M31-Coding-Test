@@ -141,3 +141,102 @@ def report(res: pd.DataFrame, metric: str, q: float = 0.15) -> None:
     if np.isfinite(worst):
         print(f"  largest across-fold spread of any effect: {worst:.5f} "
               f"(diagnostic; folds share training data so this is not an SE)")
+
+
+# ---------------------------------------------------------------------------
+# Fractional factorials need a different estimator from full ones.
+# ---------------------------------------------------------------------------
+
+def orthogonal_effects(df: pd.DataFrame, coded: list[str], metric: str,
+                       sigma_pure: float | None = None,
+                       n_pure: int = 0) -> pd.DataFrame:
+    """Main effects of an ORTHOGONAL design, by contrast rather than by pairing.
+
+    **Why `paired_effects` cannot be used here, found by testing before running.**
+    Pairing needs each f=+1 run to have a twin at f=-1 matching on every other
+    factor. In a 2^(5-1) fraction the fifth factor is *determined* by the other
+    four, so no such twin exists -- every pivot cell has one level missing and
+    `paired_effects` correctly returns nothing at all.
+
+    The contrast is nevertheless unbiased here, for a different reason:
+    **orthogonality**. Each factor's +1 half is balanced in every other factor,
+    so their contributions cancel in expectation without any matching. That is
+    the property `resolution_v_design` verifies numerically.
+
+        effect = mean(y | f=+1) - mean(y | f=-1),     SE = 2*sigma/sqrt(N)
+
+    **Estimating sigma without residual degrees of freedom.** Fitting 5 main
+    effects and 10 two-factor interactions to 16 runs leaves 0 residual df, so
+    the design cannot estimate its own error from the corners. Two independent
+    routes, both reported:
+
+    * **Pure error** from replicated centre points (what they are for). Honest
+      but thin -- 4 replicates is 3 df, so the t multiplier is large.
+    * **Lenth's PSE** (Technometrics 31:469-473, 1989), the standard method for
+      exactly this case. It assumes effect sparsity -- that most effects are
+      null -- and estimates the noise from the median of the small ones:
+
+          s0  = 1.5 * median(|effect|)
+          PSE = 1.5 * median{|effect| : |effect| < 2.5*s0}
+
+      Robust to a few large real effects, because they are trimmed out by the
+      2.5*s0 cut before the second median.
+
+    They are reported side by side deliberately: agreement is evidence, and
+    disagreement means effect sparsity fails or the centre points are unlucky,
+    which is itself worth knowing before anything is concluded.
+    """
+    out = []
+    n = len(df)
+    for c in coded:
+        v = df[c].to_numpy()
+        hi, lo = df.loc[v > 0, metric], df.loc[v < 0, metric]
+        if len(hi) == 0 or len(lo) == 0:
+            continue
+        out.append({"factor": c, "effect": float(hi.mean() - lo.mean()),
+                    "n_hi": len(hi), "n_lo": len(lo)})
+    res = pd.DataFrame(out)
+    if res.empty:
+        return res
+
+    e = res.effect.to_numpy()
+    # Lenth's pseudo standard error.
+    s0 = 1.5 * np.median(np.abs(e))
+    small = np.abs(e)[np.abs(e) < 2.5 * s0] if s0 > 0 else np.abs(e)
+    pse = 1.5 * np.median(small) if len(small) else float("nan")
+    res["lenth_pse"] = pse
+    d_lenth = max(1, len(e) // 3)
+    res["t_lenth"] = res.effect / pse if pse > 0 else np.nan
+    res["p_lenth"] = 2 * stats.t.sf(np.abs(res.t_lenth), df=d_lenth)
+    res["margin_of_error"] = stats.t.ppf(0.975, d_lenth) * pse
+
+    if sigma_pure is not None and np.isfinite(sigma_pure) and n_pure > 1:
+        se = 2 * sigma_pure / np.sqrt(n)
+        res["se_pure"] = se
+        res["t_pure"] = res.effect / se if se > 0 else np.nan
+        res["p_pure"] = 2 * stats.t.sf(np.abs(res.t_pure), df=n_pure - 1)
+        res["ci_lo"] = res.effect - stats.t.ppf(0.975, n_pure - 1) * se
+        res["ci_hi"] = res.effect + stats.t.ppf(0.975, n_pure - 1) * se
+        res["shrunken"] = shrink(res.effect.to_numpy(),
+                                 np.full(len(res), se))
+    else:
+        res["shrunken"] = shrink(e, np.full(len(e), pse if pse > 0 else 1.0))
+
+    return res.reindex(res.effect.abs().sort_values(ascending=False).index
+                       ).reset_index(drop=True)
+
+
+def report_orthogonal(res: pd.DataFrame, metric: str) -> None:
+    if res.empty:
+        print("  no factors to contrast")
+        return
+    print(f"\n=== MAIN EFFECTS on {metric} (orthogonal contrasts) ===")
+    cols = [c for c in ("factor", "effect", "ci_lo", "ci_hi", "se_pure",
+                        "lenth_pse", "t_lenth", "p_lenth", "shrunken")
+            if c in res.columns]
+    print(res[cols].to_string(index=False, float_format=lambda v: f"{v:+.5f}"))
+    moe = float(res.margin_of_error.iloc[0])
+    big = res.loc[res.effect.abs() > moe, "factor"].tolist()
+    print(f"\n  Lenth margin of error (95%): {moe:.5f}")
+    print(f"  exceeding it: {big if big else 'none -- no effect is resolvable'}")
+    print("  Act on `shrunken`. 'Not resolvable' is a result, not a failure.")

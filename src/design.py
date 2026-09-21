@@ -220,6 +220,157 @@ def report_sigma(out: dict) -> None:
         print("  VERDICT: a 20-run design is worth running.")
 
 
+# ---------------------------------------------------------------------------
+# The design itself.
+# ---------------------------------------------------------------------------
+
+# Centre point at coded 0. `lr` and `weight_decay` are coded in LOG space, so
+# their centre is the geometric mean of the two levels. `fusion` is genuinely
+# categorical and has no centre, so centre runs sit at the reference level --
+# which makes the curvature test valid only within the fusion="none" half.
+# Stated rather than buried; it is the price of putting a categorical factor
+# into a design that carries centre points.
+CENTRE_CAPACITY = (2, 160, 5)     # n_embd / n_head = 32, as at both corners
+
+
+def _read_ledger(event):
+    """Last record of `event` in the ledger, or None."""
+    if not LEDGER.exists():
+        return None
+    hit = None
+    for line in LEDGER.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            row = json.loads(line)
+            if row.get("event") == event:
+                hit = row
+    return hit
+
+
+def design_runs(basin_lr):
+    """16 resolution-V corners plus 4 replicated centre points."""
+    d = resolution_v_design()
+    lo_hi = dict(FACTORS)
+    lo_hi["lr"] = (basin_lr / 3, basin_lr * 3)
+
+    runs = []
+    for i, row in enumerate(d):
+        pick = {f: lo_hi[f][0] if c < 0 else lo_hi[f][1]
+                for f, c in zip(FACTORS, row)}
+        n_layer, n_embd, n_head = pick.pop("capacity")
+        runs.append({"run": i, "kind": "corner", "n_layer": n_layer,
+                     "n_embd": n_embd, "n_head": n_head, **pick,
+                     **{"c_" + f: int(c) for f, c in zip(FACTORS, row)}})
+
+    n_layer, n_embd, n_head = CENTRE_CAPACITY
+    wd_lo, wd_hi = FACTORS["weight_decay"]
+    for j in range(4):
+        runs.append({"run": 16 + j, "kind": "centre", "n_layer": n_layer,
+                     "n_embd": n_embd, "n_head": n_head,
+                     "lr": basin_lr,
+                     "weight_decay": float(np.sqrt(wd_lo * wd_hi)),
+                     "dropout": float(np.mean(FACTORS["dropout"])),
+                     "fusion": "none",
+                     **{"c_" + f: 0 for f in FACTORS}})
+    return runs
+
+
+def run_design(root=".", arm="P4", verbose=True):
+    from .data.examples import ExampleConfig
+    from .data.sequences import SeqConfig
+    from .train_finetune import TrainConfig, train
+
+    basin = _read_ledger("lr_basin")
+    sig = _read_ledger("seed_sigma")
+    if basin is None:
+        raise SystemExit("no lr_basin in the ledger -- run `--lr-basin` first")
+    basin_lr = float(basin["basin_lr"])
+    runs = design_runs(basin_lr)
+
+    print("design: %d runs (16 corners + 4 centre), basin lr = %.1e"
+          % (len(runs), basin_lr), flush=True)
+    if sig:
+        s = float(sig["sigma_auroc"])
+        se = 2 * s / np.sqrt(len(runs))
+        print("  measured sigma = %.4f -> SE(effect) = %.4f, MDE(80%%) = %.4f"
+              % (s, se, 2.8 * se), flush=True)
+        print("  E14: sigma sets N, not the factor count. All five factors run;"
+              " 'not resolvable' is a reportable outcome.", flush=True)
+    else:
+        print("  WARNING: no seed_sigma in the ledger, so the effects below have"
+              " no measured noise scale to be judged against.", flush=True)
+
+    rows = []
+    for r in runs:
+        t = time.time()
+        # The training seed VARIES with the run (Bouthillier et al. 2021): a
+        # fixed seed makes sigma cosmetically small and the conclusions
+        # seed-specific. The SPLIT seed 12345 stays fixed -- a different thing.
+        cfg = TrainConfig(seed=r["run"], dev_frac=0.2, epochs=20,
+                          n_layer=r["n_layer"], n_embd=r["n_embd"],
+                          n_head=r["n_head"], lr=r["lr"],
+                          weight_decay=r["weight_decay"],
+                          attn_dropout=r["dropout"], resid_dropout=r["dropout"],
+                          fusion=r["fusion"])
+        res = train(arm, root, cfg, ExampleConfig(), SeqConfig(), verbose=False)
+        row = dict(r)
+        row.update({"macro_auroc": res["macro_auroc"],
+                    "macro_ap": res["macro_ap"], "epoch": res["epoch"],
+                    "minutes": (time.time() - t) / 60})
+        rows.append(row)
+        if verbose:
+            print("  run %2d %-7s AUROC %.4f  AP %.4f  [%.1f min]"
+                  % (r["run"], r["kind"], row["macro_auroc"], row["macro_ap"],
+                     row["minutes"]), flush=True)
+        # Written after every run, so a crash at run 17 does not lose 16 runs.
+        pd.DataFrame(rows).to_csv("outputs/design_runs.csv", index=False)
+        with LEDGER.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(dict({"event": "design_run"}, **row)) + '\n')
+    return pd.DataFrame(rows)
+
+
+def analyse_design(df, metric="macro_ap"):
+    """Main effects from the corners; pure error and curvature from the centre."""
+    from .effects import orthogonal_effects, report_orthogonal
+
+    corners = df[df.kind == "corner"].copy()
+    centre = df[df.kind == "centre"]
+
+    # Pure error first: it feeds the effect intervals, so it cannot be computed
+    # after them. `paired_effects` is deliberately NOT used -- in a 2^(5-1)
+    # fraction the fifth factor is determined by the other four, so no run has a
+    # twin matching on everything else and pairing returns nothing at all. Found
+    # by testing the analysis on synthetic runs before spending 5 CPU-hours.
+    s_pure = float(centre[metric].std(ddof=1)) if len(centre) >= 2 else None
+
+    coded = ["c_" + f for f in FACTORS]
+    eff = orthogonal_effects(corners, coded, metric,
+                             sigma_pure=s_pure, n_pure=len(centre))
+    if not eff.empty:
+        eff["factor"] = eff.factor.str.replace("c_", "", regex=False)
+    report_orthogonal(eff, metric + " (design corners)")
+    eff.to_csv("outputs/design_effects_" + metric + ".csv", index=False)
+
+    if len(centre) >= 2:
+        # Pure error, estimated INSIDE the experiment rather than assumed
+        # (computed above, since the effect intervals depend on it).
+        print("\n  pure error from %d centre replicates: sigma = %.4f"
+              % (len(centre), s_pure))
+        d = float(corners[metric].mean() - centre[metric].mean())
+        se = s_pure * np.sqrt(1.0 / len(corners) + 1.0 / len(centre))
+        z = d / se if se > 0 else float("nan")
+        print("  curvature (corners - centre): %+.4f (%+.1f sigma of pure error)"
+              % (d, z))
+        if abs(z) >= 2:
+            print("    => the response is NOT linear over these ranges. A"
+                  " two-level contrast straddling an interior optimum reads near"
+                  " zero, so no factor here may be called inert.")
+        else:
+            print("    => no detectable curvature; the two-level reads are"
+                  " interpretable at face value.")
+        print("  NOTE: centre runs sit at fusion='none', so curvature is tested"
+              " only within the non-fusion half.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=0,
@@ -227,6 +378,10 @@ def main() -> None:
     ap.add_argument("--lr-basin", action="store_true",
                     help="1-D learning-rate sweep; must precede the design")
     ap.add_argument("--show-design", action="store_true")
+    ap.add_argument("--run", action="store_true",
+                    help="run the full design (needs --lr-basin first)")
+    ap.add_argument("--analyse", action="store_true",
+                    help="re-analyse outputs/design_runs.csv, no re-run")
     a = ap.parse_args()
 
     if a.show_design:
@@ -235,6 +390,18 @@ def main() -> None:
         print(pd.DataFrame(d, columns=list(FACTORS)).to_string())
         print("\n  verified: all 5 main effects and all 10 two-factor "
               "interactions mutually orthogonal")
+        return
+
+    if a.analyse:
+        df = pd.read_csv("outputs/design_runs.csv")
+        for m in ("macro_ap", "macro_auroc"):
+            analyse_design(df, m)
+        return
+
+    if a.run:
+        df = run_design(".")
+        for m in ("macro_ap", "macro_auroc"):
+            analyse_design(df, m)
         return
 
     if a.lr_basin:

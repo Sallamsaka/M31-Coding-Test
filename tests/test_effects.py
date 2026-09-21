@@ -13,7 +13,7 @@ import itertools
 import numpy as np
 import pandas as pd
 
-from src.effects import paired_effects, shrink
+from src.effects import orthogonal_effects, paired_effects, shrink
 
 FACTORS = ["a", "b", "c"]
 
@@ -104,3 +104,71 @@ def test_effect_sign_follows_the_truth():
     res = paired_effects(_table({"a": 0.01, "b": -0.01, "c": 0.0}, noise=0.001,
                                 seed=3), FACTORS, "auroc").set_index("factor")
     assert res.loc["a", "effect"] > 0 and res.loc["b", "effect"] < 0
+
+
+# --------------------------------------------------------------------------
+# Fractional designs need `orthogonal_effects`, not `paired_effects`.
+# --------------------------------------------------------------------------
+
+def _res_v():
+    """2^(5-1), E = ABCD, as src.design builds it."""
+    base = np.array(list(itertools.product([-1, 1], repeat=4)))
+    d = np.hstack([base, base.prod(axis=1, keepdims=True)])
+    cols = [f"c_{i}" for i in range(5)]
+    return pd.DataFrame(d, columns=cols), cols
+
+
+def test_pairing_returns_nothing_on_a_fractional_design():
+    """The bug this split was written for, pinned so it cannot silently return.
+
+    In a 2^(5-1) fraction the fifth factor is determined by the other four, so
+    no run has a twin matching on everything else. `paired_effects` must come
+    back empty rather than quietly contrasting mismatched runs.
+    """
+    df, cols = _res_v()
+    df["y"] = np.arange(len(df), dtype=float)
+    df["fold"] = 0
+    assert paired_effects(df, cols, "y", fold_col="fold").empty
+
+
+def test_orthogonal_effects_recovers_truth_exactly_without_noise():
+    df, cols = _res_v()
+    truth = {"c_0": 0.02, "c_3": -0.01}
+    df["y"] = 0.5 + sum(v * df[k] for k, v in truth.items())
+    res = orthogonal_effects(df, cols, "y").set_index("factor")
+    for c in cols:
+        want = 2 * truth.get(c, 0.0)      # effect spans -1 -> +1
+        assert abs(res.loc[c, "effect"] - want) < 1e-12, c
+
+
+def test_orthogonal_se_matches_two_sigma_over_root_n():
+    """SE(effect) = 2*sigma/sqrt(N) -- the identity E14 rests on."""
+    df, cols = _res_v()
+    rng = np.random.default_rng(0)
+    sigma, N = 0.01, len(df)
+    est = []
+    for _ in range(400):
+        df["y"] = rng.normal(0, sigma, N)
+        est.append(orthogonal_effects(df, cols, "y").set_index("factor")
+                   .loc["c_0", "effect"])
+    emp = np.std(est, ddof=1)
+    assert abs(emp - 2 * sigma / np.sqrt(N)) < 0.0004, emp
+
+
+def test_lenth_pse_is_robust_to_one_dominant_effect():
+    """Lenth trims large effects before the second median, so a single huge
+    factor must not inflate the noise estimate and mask the rest."""
+    df, cols = _res_v()
+    quiet = 0.5 + 0.001 * df["c_1"]
+    res_small = orthogonal_effects(df.assign(y=quiet), cols, "y")
+    res_big = orthogonal_effects(df.assign(y=quiet + 0.5 * df["c_0"]), cols, "y")
+    pse_small = float(res_small.lenth_pse.iloc[0])
+    pse_big = float(res_big.lenth_pse.iloc[0])
+    assert abs(pse_big - pse_small) < 1e-9, (pse_small, pse_big)
+
+
+def test_orthogonal_effects_ranks_by_magnitude():
+    df, cols = _res_v()
+    df["y"] = 0.5 + 0.02 * df["c_2"] + 0.005 * df["c_4"]
+    res = orthogonal_effects(df, cols, "y")
+    assert res.factor.iloc[0] == "c_2" and res.factor.iloc[1] == "c_4"

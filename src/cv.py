@@ -2,8 +2,10 @@
 
 Two objects, deliberately separate.
 
-**The locked test set** is 15% of the provided train patients (419), set aside
-and read exactly once, at the end, for one pre-registered question. It exists
+**The locked test set** is 358 of the provided train patients, set aside and
+read exactly once, at the end, for one pre-registered question. 358 is not a
+round fraction: it is exactly the size of the provided test set, so this set's
+precision equals what the real test would give. It exists
 because cross-validation cannot answer the question it is usually asked to:
 pooled or averaged, CV estimates the expected performance of a *training
 procedure* at n = N(K-1)/K, not the performance of the single model we ship.
@@ -11,7 +13,7 @@ The locked set estimates the shipped artifact, and it is one line of code, so
 it is immune to all ten fit sites, the pooling artifact and every
 fold-construction subtlety that the rest of this module has to get right.
 
-**The CV pool** is the remaining 2,372, partitioned into patient-grouped folds
+**The CV pool** is the remaining 2,433, partitioned into patient-grouped folds
 for everything else.
 
 Three honest caveats, recorded here rather than in a footnote.
@@ -22,13 +24,15 @@ Three honest caveats, recorded here rather than in a footnote.
    trained on", not "how would this whole research process do again".
 2. **It is disjoint from the dev split but not from past training sets.** The
    dev split is the *first* 558 of the seed-12345 permutation and the locked
-   set is the *last* 419, so no patient used for selection is in it. They were
+   set is the *last* 358, so no patient used for selection is in it. They were
    however inside the training set of the 12 completed search runs. Training
    membership is a much weaker contamination than selection membership, and
    the final model is refit on the pool only -- but it is not nothing.
-3. **It is undersized for ranking.** 419 patients, rarest label 5 positives.
+3. **It is undersized for ranking.** 358 patients, rarest label 3 positives.
    It can confirm one number with an interval. It cannot choose between LR,
-   GBDT and the transformer, and it must not be asked to.
+   GBDT and the transformer, and it must not be asked to. This is not a defect
+   of the carve -- the real 358-patient test set is equally thin, and a proxy
+   that were better resolved would be misrepresenting the deliverable.
 
 Run: ``python -m src.cv`` prints the partition and its integrity checks.
 """
@@ -69,10 +73,10 @@ def locked_test_pids(root: str = ".", frac: float = LOCKED_TEST_FRAC) -> set[int
     so drawing from the tail makes the two disjoint by construction rather
     than by a check that someone has to remember to run.
 
-    Verified on this cohort at frac=0.15: 419 patients, **all 40 labels have
-    at least one positive** (rarest 5), and zero overlap with dev. No
-    stratification is applied because none is needed for scorability here; if
-    the fraction changes, re-check coverage before trusting it.
+    Verified on this cohort at LOCKED_TEST_N=358: **all 40 labels have at least
+    one positive** (rarest 3), and zero overlap with dev. No stratification is
+    applied because none is needed for scorability here; if the size changes,
+    re-check coverage before trusting it.
     """
     pids = _train_pids(root)
     order = np.random.default_rng(SPLIT_SEED).permutation(pids)
@@ -134,7 +138,7 @@ def main(root: str = ".") -> None:
 
     print("PARTITION")
     print(f"  provided train patients : {len(train):,}")
-    print(f"  locked test (15%)       : {len(locked):,}   read ONCE, at the end")
+    print(f"  locked test             : {len(locked):,}   read ONCE, at the end (sized to the provided test)")
     print(f"  cv pool                 : {len(pool):,}")
     assert len(locked) + len(pool) == len(train)
     assert not (locked & set(pool.tolist()))

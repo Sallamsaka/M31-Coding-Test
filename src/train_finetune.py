@@ -328,6 +328,43 @@ def inner_split_pids(root: str | Path, dev_frac: float, holdout_frac: float,
             set(order[n_dev:n_dev + n_hold].tolist()))
 
 
+class WeightEMA:
+    """Exponential moving average of a state_dict, for scoring.
+
+    Initialised to the FIRST state it sees, which is already unbiased -- so
+    there is deliberately no Adam-style 1/(1-d^t) correction. Applying both
+    conventions inflates: feeding constant weights returned 5.0x them at the
+    first step, then 2.8x, 2.0x. That bug shipped in the closure version and was
+    caught only because this logic became testable.
+
+    Non-float buffers (integer counters and the like) are copied, not averaged.
+    """
+
+    def __init__(self, decay: float = 0.8):
+        self.decay = float(decay)
+        self.state: dict | None = None
+        self.seen = 0
+
+    def update(self, sd: dict) -> dict:
+        d = self.decay
+        if self.state is None:
+            # Only FLOAT tensors become float. Blanket .float() here promoted
+            # integer buffers, which then satisfied is_floating_point() on the
+            # next call and got averaged -- silently corrupting any counter or
+            # index buffer the model carries.
+            self.state = {k: (v.detach().clone().float()
+                              if v.is_floating_point() else v.detach().clone())
+                          for k, v in sd.items()}
+        else:
+            for k, v in sd.items():
+                if self.state[k].is_floating_point():
+                    self.state[k].mul_(d).add_(v.detach().float(), alpha=1 - d)
+                else:
+                    self.state[k] = v.detach().clone()
+        self.seen += 1
+        return dict(self.state)
+
+
 def _ckpt_path(root, arm: str, seed: int) -> Path:
     return Path(root) / "artifacts" / f"ckpt_last_{arm}_seed{seed}.pt"
 
@@ -547,26 +584,7 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
 
     # EMA of the weights, updated once per evaluated epoch. float() copies so
     # the average is never a view onto live parameters.
-    ema_state: dict | None = None
-    ema_seen = 0
-
-    def _ema_update(sd):
-        nonlocal ema_state, ema_seen
-        d = cfg.ema_decay
-        if ema_state is None:
-            ema_state = {k: v.detach().clone().float() for k, v in sd.items()}
-        else:
-            for k, v in sd.items():
-                if ema_state[k].is_floating_point():
-                    ema_state[k].mul_(d).add_(v.detach().float(), alpha=1 - d)
-                else:
-                    ema_state[k] = v.detach().clone()
-        ema_seen += 1
-        # Bias correction, as in Adam: without it the first epochs are pulled
-        # toward the initialisation and the early EMA scores are meaningless.
-        c = 1 - d ** ema_seen
-        return {k: (v / c if v.is_floating_point() else v)
-                for k, v in ema_state.items()}
+    ema = WeightEMA(cfg.ema_decay)
 
     fingerprint = _config_fingerprint(cfg, arm, len(vocab))
     ckpt = _ckpt_path(root, arm, cfg.seed)
@@ -635,7 +653,7 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
             if cfg.ema_decay > 0:
                 live = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 try:
-                    avg = _ema_update(model.state_dict())
+                    avg = ema.update(model.state_dict())
                     model.load_state_dict({k: v.to(live[k].dtype)
                                            for k, v in avg.items()})
                     Pe = predict(model, pack.tokens, pack.dt, pack.lengths, va,

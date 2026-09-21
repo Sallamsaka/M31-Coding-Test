@@ -148,3 +148,64 @@ def test_min_delta_default_preserves_the_original_behaviour():
 def test_ckpt_path_is_keyed_by_arm_and_seed():
     a = _ckpt_path(".", "P4", 0)
     assert a != _ckpt_path(".", "P3", 0) and a != _ckpt_path(".", "P4", 1)
+
+
+# --------------------------------------------------------------------------
+# WeightEMA. These exist because the first version was a closure inside
+# train(), therefore untestable, and shipped a bias-correction bug that
+# returned 5x the weights at the first epoch.
+# --------------------------------------------------------------------------
+
+def test_ema_of_a_constant_is_that_constant():
+    """The invariant that caught the bug. Averaging an unchanging quantity must
+    return it unchanged at EVERY step, including the first."""
+    from src.train_finetune import WeightEMA
+    e = WeightEMA(0.8)
+    w = {"a": torch.tensor([1.0, -2.0])}
+    for _ in range(6):
+        out = e.update(w)
+        assert torch.allclose(out["a"], w["a"]), out["a"]
+
+
+def test_ema_step_response_matches_the_closed_form():
+    """After a 0 -> 1 step the average must approach 1 as 1 - d^t exactly."""
+    from src.train_finetune import WeightEMA
+    d = 0.8
+    e = WeightEMA(d)
+    e.update({"a": torch.tensor([0.0])})
+    for t in range(1, 6):
+        got = e.update({"a": torch.tensor([1.0])})["a"].item()
+        assert abs(got - (1 - d ** t)) < 1e-6, (t, got, 1 - d ** t)
+
+
+def test_ema_is_not_a_view_onto_the_live_weights():
+    """If the average aliased the parameters it would track them exactly and
+    the whole point -- damping the bounce -- would silently not happen."""
+    from src.train_finetune import WeightEMA
+    e = WeightEMA(0.5)
+    w = {"a": torch.tensor([0.0])}
+    e.update(w)
+    w["a"].add_(100.0)                      # mutate the "live" tensor in place
+    assert e.state["a"].item() == 0.0, "EMA aliased the source tensor"
+
+
+def test_ema_copies_non_float_buffers_instead_of_averaging_them():
+    """Averaging an integer counter is meaningless and would corrupt a buffer."""
+    from src.train_finetune import WeightEMA
+    e = WeightEMA(0.8)
+    e.update({"n": torch.tensor([3], dtype=torch.long)})
+    out = e.update({"n": torch.tensor([9], dtype=torch.long)})
+    assert out["n"].item() == 9 and out["n"].dtype == torch.long
+
+
+def test_ema_decay_controls_the_averaging_window():
+    """Higher decay = longer memory = slower response to a change."""
+    from src.train_finetune import WeightEMA
+    resp = {}
+    for d in (0.5, 0.9):
+        e = WeightEMA(d)
+        e.update({"a": torch.tensor([0.0])})
+        for _ in range(3):
+            v = e.update({"a": torch.tensor([1.0])})["a"].item()
+        resp[d] = v
+    assert resp[0.5] > resp[0.9], resp

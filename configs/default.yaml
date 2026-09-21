@@ -104,6 +104,14 @@ transformer:
   weight_decay: 0.1                 # [C]
   grad_clip: 1.0                    # [C]
   attn_dropout: 0.1                 # [L] DropKey: 5x larger gain at small n
+  # Ablation switches for the design-claim experiment. Both default ON; the
+  # ablation overrides them per arm. They zero a signal rather than deleting a
+  # tensor, so the parameter count is identical across arms and the experiment
+  # measures the component and not the capacity.
+  use_time_encoding: true           # [D] per-token Time2Vec
+  use_dt_bias: true                 # [M] pairwise Δt attention bias. STAR measures
+                                    # temporal-bias-only at 0.832 vs 0.785 with no
+                                    # bias (MIMIC-IV, 29,544 patients)
   # The four coherent arms. Readout follows the mask and the pretraining
   # objective follows the mask, so these are the only consistent combinations.
   arms:

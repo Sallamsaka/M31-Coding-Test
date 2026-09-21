@@ -80,6 +80,24 @@ class GPTConfig:
     fusion_dim: int = 64
     n_features: int = 0
 
+    use_time_encoding: bool = True
+    """Ablation switch: include the per-token Time2Vec encoding at all.
+
+    False zeroes the time half of the token/time concatenation, leaving the
+    token embedding and the linear mix intact so the shapes and the parameter
+    count are unchanged. What remains is a model that knows WHICH codes occurred
+    and, through the visibility mask, their order -- but not how far apart they
+    are.
+    """
+
+    use_dt_bias: bool = True
+    """Ablation switch: include the pairwise Δt attention bias.
+
+    False replaces the learned per-(head, bucket) scalars with zeros. The
+    visibility mask is untouched, so causality is preserved and only the
+    *graded* notion of temporal distance is removed.
+    """
+
     causal: bool = True
     """Causal (each position sees only the past) or bidirectional.
 
@@ -277,8 +295,14 @@ class PatientTransformer(nn.Module):
         B, T = dt.shape
         gap = (dt.unsqueeze(2) - dt.unsqueeze(1)).abs()               # (B,T,T)
         idx = torch.bucketize(gap, self.bucket_edges)                 # 0 iff gap==0
-        bias = self.dt_bias[:, idx.clamp(max=self.cfg.n_dt_buckets - 1)]
-        bias = bias.permute(1, 0, 2, 3)                               # (B,nh,T,T)
+        if self.cfg.use_dt_bias:
+            bias = self.dt_bias[:, idx.clamp(max=self.cfg.n_dt_buckets - 1)]
+            bias = bias.permute(1, 0, 2, 3)                           # (B,nh,T,T)
+        else:
+            # Ablated: no graded temporal distance. The visibility mask below is
+            # untouched, so this removes "how far apart" without removing
+            # "which came first".
+            bias = torch.zeros(B, self.cfg.n_head, T, T, device=dt.device)
 
         causal = self.cfg.causal if causal is None else causal
         if not causal:
@@ -298,7 +322,10 @@ class PatientTransformer(nn.Module):
                strict: bool = False, causal: bool | None = None,
                inject: tuple[int, torch.Tensor] | None = None) -> torch.Tensor:
         pad = tokens != 0
-        x = self.mix(torch.cat([self.tok(tokens), self.time(dt)], dim=-1))
+        t = self.time(dt)
+        if not self.cfg.use_time_encoding:
+            t = torch.zeros_like(t)     # keep shapes and parameter count fixed
+        x = self.mix(torch.cat([self.tok(tokens), t], dim=-1))
         if inject is not None:                # replace a position's embedding
             pos, vec = inject
             x = torch.cat([vec, x[:, pos + 1:]], dim=1) if pos == 0 else x

@@ -311,3 +311,117 @@ def test_fused_feature_token_is_visible_to_the_whole_sequence():
     assert (ha[:, 0] - hb[:, 0]).abs().max().item() > 1e-4, "injection failed"
     assert (ha[:, -1] - hb[:, -1]).abs().max().item() > 1e-5, \
         "the feature token never reaches the readout position through attention"
+
+
+# --------------------------------------------------------------------------
+# Ablation switches for the design-claim experiment (W7).
+#
+# `docs/01-why-time.md` argues formally that without a positional signal a
+# transformer sees only a multiset. That argument is the intellectual centre of
+# the submission and nothing measured it, because until now the model had no
+# switch to turn the time signals off. These tests assert the switches do what
+# they claim BEHAVIOURALLY -- that removing a signal removes the model's
+# sensitivity to it -- rather than asserting that a flag is set.
+# --------------------------------------------------------------------------
+
+def _ablated(**kw):
+    torch.manual_seed(0)
+    m = PatientTransformer(GPTConfig(vocab_size=VOCAB, **kw))
+    m.eval()
+    return m
+
+
+def _fixed_batch(B=4, T=16, seed=3):
+    """Every row full-length, so a permutation needs no pad bookkeeping."""
+    rng = np.random.default_rng(seed)
+    tokens = torch.from_numpy(rng.integers(1, VOCAB, (B, T))).long()
+    base = np.sort(rng.choice([2000., 900., 365., 90., 30., 7., 1.],
+                              (B, T - 1), replace=True), axis=1)[:, ::-1].copy()
+    dt = torch.zeros(B, T)
+    dt[:, :T - 1] = torch.from_numpy(base).float()
+    lengths = torch.full((B,), T, dtype=torch.long)
+    return tokens, dt, lengths
+
+
+def test_ablating_both_time_signals_makes_dt_magnitude_irrelevant():
+    """With Time2Vec and the Δt bias off, scaling every gap must change nothing.
+
+    Doubling dt preserves order and every tie, so the visibility mask is
+    identical; only the *magnitudes* differ. A model with no time signals must
+    be blind to that.
+    """
+    tokens, dt, lengths = _fixed_batch()
+    m = _ablated(use_time_encoding=False, use_dt_bias=False)
+    with torch.no_grad():
+        a, b = m(tokens, dt, lengths), m(tokens, dt * 2.0, lengths)
+    assert torch.allclose(a, b, atol=1e-6), (a - b).abs().max().item()
+
+
+def test_the_dt_scaling_probe_is_not_vacuous():
+    """Positive control: the DEFAULT model must be sensitive to that scaling.
+
+    Without this, the test above would pass against a probe that never
+    perturbed anything.
+    """
+    tokens, dt, lengths = _fixed_batch()
+    m = _ablated()
+    with torch.no_grad():
+        a, b = m(tokens, dt, lengths), m(tokens, dt * 2.0, lengths)
+    assert not torch.allclose(a, b, atol=1e-6), "probe moved nothing"
+
+
+def test_dt_bias_off_alone_still_leaves_the_model_time_aware():
+    """Each switch removes its own signal, not the other's."""
+    tokens, dt, lengths = _fixed_batch()
+    m = _ablated(use_dt_bias=False)
+    with torch.no_grad():
+        a, b = m(tokens, dt, lengths), m(tokens, dt * 2.0, lengths)
+    assert not torch.allclose(a, b, atol=1e-6), "Time2Vec should still see dt"
+
+
+def test_ablating_time_does_NOT_by_itself_produce_a_bag_of_codes():
+    """The subtlety that makes the 4-arm framing of this ablation wrong.
+
+    The visibility mask is derived from `dt`, so a causal model still knows
+    which event came first even with both explicit time signals removed.
+    Permuting positions must therefore still move the output. A "no time" arm
+    is *not* the multiset baseline that `01-why-time.md` reasons about.
+    """
+    tokens, dt, lengths = _fixed_batch()
+    m = _ablated(use_time_encoding=False, use_dt_bias=False)
+    perm = torch.randperm(tokens.shape[1], generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        a = m(tokens, dt, lengths)
+        b = m(tokens[:, perm], dt[:, perm], lengths)
+    assert not torch.allclose(a, b, atol=1e-6), (
+        "order should still reach the model through the visibility mask")
+
+
+def test_the_true_multiset_baseline_is_permutation_invariant():
+    """`01-why-time.md`'s claim, made executable.
+
+    Drop both time signals AND the direction constraint AND the position-picking
+    readout, and what is left provably cannot distinguish orderings: every
+    position sees every other with zero bias, and mean pooling is symmetric.
+    This is the arm the time ablation must compare against.
+    """
+    tokens, dt, lengths = _fixed_batch()
+    m = _ablated(use_time_encoding=False, use_dt_bias=False,
+                 causal=False, readout="mean")
+    perm = torch.randperm(tokens.shape[1], generator=torch.Generator().manual_seed(2))
+    with torch.no_grad():
+        a = m(tokens, dt, lengths)
+        b = m(tokens[:, perm], dt[:, perm], lengths)
+    assert torch.allclose(a, b, atol=1e-5), (a - b).abs().max().item()
+
+
+def test_ablation_switches_do_not_change_the_parameter_count():
+    """Zeroing a signal, not deleting the tensor, so capacity is held fixed.
+
+    An ablation that also shrinks the model measures capacity, not the
+    component -- the most common way this experiment is got wrong.
+    """
+    full = _ablated().n_params()
+    for kw in ({"use_time_encoding": False}, {"use_dt_bias": False},
+               {"use_time_encoding": False, "use_dt_bias": False}):
+        assert _ablated(**kw).n_params() == full, kw

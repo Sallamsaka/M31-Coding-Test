@@ -82,6 +82,10 @@ def test_transformer_defaults_and_arms_match(cfg):
     assert c["lr"] == t.lr
     assert c["grad_clip"] == t.grad_clip
     assert c["attn_dropout"] == g.attn_dropout
+    # Ablation switches: checked here so the YAML cannot drift from the
+    # dataclass the way n_dt_buckets did.
+    assert c["use_time_encoding"] == g.use_time_encoding
+    assert c["use_dt_bias"] == g.use_dt_bias
 
     assert set(c["arms"]) == set(ARMS)
     for name, spec in ARMS.items():

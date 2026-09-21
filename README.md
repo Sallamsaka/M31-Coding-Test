@@ -150,9 +150,12 @@ Refused at load time, not merely asserted about in a test:
   `STOP` after the anchor, and the organisers blanked those in test (4.41% null
   vs 1.17% in train), so any duration feature both leaks and shifts.
 
-`pytest tests/` covers 63 checks including a grep test that nothing outside
+`pytest tests/` covers 80 checks including a grep test that nothing outside
 `timeutil` calls `pd.to_datetime`, and one that nothing outside `cohort` and
-`sequences` reads the ordering timestamp.
+`sequences` reads the ordering timestamp. The behavioural ones assert effects
+rather than flags -- that the fully time-ablated model is bit-identical when
+every gap is doubled, for instance, with the positive control asserted beside it
+so the probe cannot be vacuous.
 
 ## Results
 

@@ -173,8 +173,17 @@ def main(argv: list[str] | None = None) -> None:
     # feature names and the at-risk rule, because a bag of estimators with no
     # record of its input columns is not a usable artifact.
     Path("artifacts").mkdir(exist_ok=True)
+    # Save EVERY fitted model, not just `best` and lr.
+    #
+    # The old condition was `name in (best, "lr")`. When the selected model is
+    # the ENSEMBLE that set contains only "lr", because "ensemble" is not a key
+    # in `fitted` -- it is a combination, not an estimator. So the submission was
+    # written from lr+gbdt while only lr was saved, the GBDT that cost 1,598
+    # seconds was discarded, and predictions.csv could not be rebuilt from any
+    # artifact on disk. test_saved_model_reproduces_predictions_csv caught it
+    # the moment the ensemble started winning.
     for name, models in fitted.items():
-        if name in (best, "lr"):
+        if True:
             joblib.dump({"models": models, "feature_names": F.names,
                          "preprocess": lr_pre if name == "lr" else {},
                          "codes": codes, "blocks": F.blocks,
@@ -187,6 +196,21 @@ def main(argv: list[str] | None = None) -> None:
     # --- submission ----------------------------------------------------------
     # Real examples occupy the first len(cohort) rows with eid == pid, so the
     # real block is already in the cohort order `write_predictions` expects.
+    # The recipe, so the submission is reproducible from artifacts alone. An
+    # ensemble is a rule over models rather than a model, and a rule that lives
+    # only in the code that produced one CSV is not a reproducible artifact.
+    joblib.dump({"selected": best,
+                 "recipe": ("sigmoid(0.5*(logit(lr)+logit(gbdt)))"
+                            if best == "ensemble" else best),
+                 "components": ["lr", "gbdt"] if best == "ensemble" else [best],
+                 "feature_names": F.names, "codes": codes,
+                 "at_risk_rule": "prevalent == 0",
+                 "val_macro_auroc": scores[best][0],
+                 "val_macro_ap": scores[best][1]},
+                "artifacts/submission_manifest.joblib", compress=3)
+    print("saved artifacts/submission_manifest.joblib "
+          f"(selected={best})")
+
     sub = write_predictions(preds[best][:n_real], model_name=best, root=root,
                             extra_meta={"val_macro_auroc": scores[best][0],
                                         "val_macro_ap": scores[best][1],

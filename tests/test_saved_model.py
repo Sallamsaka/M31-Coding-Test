@@ -39,20 +39,53 @@ def test_saved_model_reproduces_predictions_csv():
     F = build_features(ROOT)
     assert F.names == bundle["feature_names"], "feature layout changed"
 
-    X = F.X.astype(np.float64)
-    if "impute" in pre:
-        X = np.where(np.isnan(X), pre["impute"], X)
-    if pre["log1p"]:
-        X = np.log1p(np.clip(X, 0, None))
-    X = (X / pre["scale_"]).astype(np.float32)      # MaxAbsScaler.transform
+    def _score(bundle_, preprocess):
+        """Re-run one saved bundle over the current feature matrix."""
+        X = F.X.astype(np.float64)
+        if "impute" in preprocess:
+            X = np.where(np.isnan(X), preprocess["impute"], X)
+        if preprocess.get("log1p"):
+            X = np.log1p(np.clip(X, 0, None))
+        if "scale_" in preprocess:
+            X = (X / preprocess["scale_"]).astype(np.float32)
+        out = np.zeros((len(X), len(bundle_["codes"])), np.float32)
+        for j, entry in enumerate(bundle_["models"]):
+            if entry["kind"] == "constant":
+                out[:, j] = entry["value"]
+            else:
+                m = entry["estimator"]
+                out[:, j] = m.predict_proba(X)[:, list(m.classes_).index(1)]
+        return out
 
-    P = np.zeros((len(X), len(bundle["codes"])), np.float32)
-    for j, entry in enumerate(bundle["models"]):
-        if entry["kind"] == "constant":
-            P[:, j] = entry["value"]
-        else:
-            m = entry["estimator"]
-            P[:, j] = m.predict_proba(X)[:, list(m.classes_).index(1)]
+    # Reproduce whatever was SHIPPED, which is not necessarily lr.
+    #
+    # This assumed the submission came from model_lr.joblib. It does not when
+    # the ensemble wins selection: predictions.csv was then written from
+    # lr+gbdt while only lr was saved, so the submission could not be rebuilt
+    # from anything on disk and the GBDT that cost 1,598 s was discarded. The
+    # test caught that correctly -- it was the pipeline that was wrong.
+    man_path = ROOT / "artifacts" / "submission_manifest.joblib"
+    manifest = joblib.load(man_path) if man_path.exists() else {"selected": "lr",
+                                                               "components": ["lr"]}
+
+    def _logit(q):
+        q = np.clip(q, 1e-6, 1 - 1e-6)
+        return np.log(q / (1 - q))
+
+    parts = []
+    for comp in manifest.get("components", ["lr"]):
+        bp = ROOT / "artifacts" / f"model_{comp}.joblib"
+        assert bp.exists(), (
+            f"the submission needs component {comp!r} but {bp.name} was never "
+            "saved -- the shipped predictions cannot be reproduced")
+        b = joblib.load(bp)
+        parts.append(_score(b, b.get("preprocess") or {}))
+
+    if len(parts) == 1:
+        P = parts[0]
+    else:
+        # The recipe recorded alongside the components.
+        P = 1.0 / (1.0 + np.exp(-sum(_logit(q) for q in parts) / len(parts)))
 
     lab = load_labels(ROOT)
     ar = at_risk_mask(lab)

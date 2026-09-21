@@ -43,3 +43,4 @@ run_design_chain.sh
 run_overnight.sh
 run_cv_retry.sh
 run_after_pipeline.sh
+run_rebaseline.sh

@@ -72,6 +72,17 @@ class TrainConfig:
     it stops improving, so the comparison is between converged models.
     """
 
+    # --- time-signal ablation (W7) -----------------------------------------
+    use_time_encoding: bool = True
+    """Per-token Time2Vec on/off. See GPTConfig for what off means."""
+    use_dt_bias: bool = True
+    """Pairwise Δt attention bias on/off.
+
+    Both zero a signal rather than deleting a tensor, so every ablation arm has
+    the same parameter count and the comparison measures the component instead
+    of the capacity.
+    """
+
     # --- capacity and regularisation, searchable ---------------------------
     n_layer: int = 4
     n_embd: int = 192
@@ -356,6 +367,7 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
         n_outputs=y.shape[1], causal=spec["causal"], readout=spec["readout"],
         n_layer=cfg.n_layer, n_embd=cfg.n_embd, n_head=cfg.n_head,
         attn_dropout=cfg.attn_dropout, resid_dropout=cfg.resid_dropout,
+        use_time_encoding=cfg.use_time_encoding, use_dt_bias=cfg.use_dt_bias,
         fusion=cfg.fusion, fusion_dim=cfg.fusion_dim,
         n_features=(feats.shape[1] if feats is not None else 0)))
 

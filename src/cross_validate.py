@@ -56,7 +56,22 @@ from .evaluate import macro_ap, macro_auroc, paired_bootstrap_delta
 from .train_baseline import (GBDTConfig, LRConfig, apply_at_risk_mask, fit_gbdt,
                              fit_lr, fit_prevalence)
 
-MODELS = ("prevalence", "lr", "gbdt")
+MODELS = ("prevalence", "trivial", "lr_default", "lr", "gbdt")
+
+# A trivial clinical rule: age, sex, and how much prior record exists. REFORMS 5f
+# and MI-CLAIM both require the comparator to be identified and justified, and
+# "beats prevalence" is far too low a bar -- a rule a clinician could apply from
+# the chart header is the honest floor.
+TRIVIAL_COLS = ("age_z", "age_z_sq", "sex_F", "sex_M", "log_n_distinct_tokens")
+
+
+def _subset(F, names):
+    """A FeatureMatrix restricted to `names`, preserving everything else."""
+    from dataclasses import replace
+    keep = [i for i, nm in enumerate(F.names) if nm in set(names)]
+    assert keep, f"none of {names} present in the feature matrix"
+    return replace(F, X=F.X[:, keep], names=[F.names[i] for i in keep],
+                   blocks={"trivial": slice(0, len(keep))})
 
 
 def _rank_within(p: np.ndarray, rows: np.ndarray) -> np.ndarray:
@@ -92,6 +107,14 @@ def run_cv(root: str = ".", n_splits: int = 5, verbose: bool = True) -> dict:
         scored[idx] = True
         preds = {
             "prevalence": fit_prevalence(F, y, fit_mask=fit_rows),
+            # W9's two missing comparators.
+            "trivial": fit_lr(_subset(F, TRIVIAL_COLS), y, ar, LRConfig(),
+                              verbose=False, fit_mask=fit_rows),
+            # Untuned: sklearn's own default C=1.0 against our tuned 0.03. The
+            # gap between these two IS the value of the tuning, which nothing
+            # else in this project reports.
+            "lr_default": fit_lr(F, y, ar, LRConfig(C=1.0), verbose=False,
+                                 fit_mask=fit_rows),
             "lr": fit_lr(F, y, ar, LRConfig(), verbose=False, fit_mask=fit_rows),
             "gbdt": fit_gbdt(F, y, ar, GBDTConfig(), verbose=False,
                              fit_mask=fit_rows),
@@ -160,7 +183,8 @@ def report_cv(res: dict, verbose: bool = True) -> None:
     print("  the raw-vs-rank gap above is the measured heterogeneity budget.")
 
     print("\n=== PAIRED COMPARISONS on identical folds ===")
-    for a, b in (("lr", "gbdt"), ("lr", "prevalence"), ("gbdt", "prevalence")):
+    for a, b in (("lr", "gbdt"), ("lr", "lr_default"), ("lr", "trivial"),
+                 ("gbdt", "trivial"), ("trivial", "prevalence")):
         d = paired_bootstrap_delta(y[rows], res["oof"][a][rows],
                                    res["oof"][b][rows])
         pt, lo, hi, _sd = d["d_macro_ap"]      # (point, lo, hi, sd)

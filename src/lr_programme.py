@@ -81,10 +81,27 @@ def _score_one(root, fold_i, fit_rows, oof_rows, block_flags, dedup, cs,
     for C in cs:
         P = fit_lr(F, y, ar, LRConfig(C=C), verbose=False, fit_mask=fit_rows)
         P = apply_at_risk_mask(P, ar)
+        # BOTH estimands, as run_baseline reports both.
+        #
+        # `auroc`/`ap` use the grader-consistent full denominator with
+        # not-at-risk pairs floored to 1e-6. `auroc_ar`/`ap_ar` restrict each
+        # label to its at-risk population, which is the incidence estimand and
+        # the one E8 and select_metric use.
+        #
+        # The distinction is not cosmetic HERE. The at-risk rule is
+        # deterministic, so every configuration ranks not-at-risk patients at
+        # the bottom equally well and collects the same free AUROC for it. That
+        # shared term inflates the level and **compresses the differences
+        # between configurations** -- which is precisely what a factorial is
+        # trying to resolve. Effects are therefore read off the at-risk columns;
+        # the full-denominator ones are kept for comparability with B's table.
         au, n_au = macro_auroc(y[oof_rows], P[oof_rows])
         ap, _ = macro_ap(y[oof_rows], P[oof_rows])
+        au_ar, n_ar = macro_auroc(y[oof_rows], P[oof_rows], mask=ar[oof_rows])
+        ap_ar, _ = macro_ap(y[oof_rows], P[oof_rows], mask=ar[oof_rows])
         out.append({"fold": fold_i, "dedup": dedup, "C": C, "n_cols": F.X.shape[1],
                     "auroc": au, "ap": ap, "n_scored": n_au,
+                    "auroc_ar": au_ar, "ap_ar": ap_ar, "n_scored_ar": n_ar,
                     **{b: f for b, f in zip(BLOCKS, block_flags)}})
     return out
 
@@ -135,15 +152,29 @@ def main() -> None:
     print(f"\nwrote outputs/lr_factorial.csv  ({len(df)} rows)")
 
     print("\n=== per-fold mean +- SD (the primary estimand, §W1) ===")
-    g = df.groupby("fold")[["auroc", "ap"]].mean()
-    print(f"  macro AUROC {g.auroc.mean():.4f} +- {g.auroc.std(ddof=1):.4f}   "
-          f"macro AP {g.ap.mean():.4f} +- {g.ap.std(ddof=1):.4f}   (over {len(g)} folds)")
+    g = df.groupby("fold")[["auroc", "ap", "auroc_ar", "ap_ar"]].mean()
+    print(f"  full denominator : AUROC {g.auroc.mean():.4f} +- {g.auroc.std(ddof=1):.4f}"
+          f"   AP {g.ap.mean():.4f} +- {g.ap.std(ddof=1):.4f}")
+    print(f"  at-risk estimand : AUROC {g.auroc_ar.mean():.4f} +- "
+          f"{g.auroc_ar.std(ddof=1):.4f}"
+          f"   AP {g.ap_ar.mean():.4f} +- {g.ap_ar.std(ddof=1):.4f}   "
+          f"(over {len(g)} folds)")
 
     if not a.quick:
         from .effects import report
-        me = main_effects(df, "auroc")
-        report(me, "macro AUROC")
+        # At-risk first: it is the sensitive one (see _score_one on why the
+        # full-denominator metric compresses between-configuration differences).
+        me = main_effects(df, "auroc_ar")
+        report(me, "macro AUROC (at-risk estimand)")
         me.to_csv("outputs/lr_main_effects.csv", index=False)
+        me_full = main_effects(df, "auroc")
+        report(me_full, "macro AUROC (full denominator, for comparability)")
+        me_full.to_csv("outputs/lr_main_effects_full.csv", index=False)
+        print(f"\n  effect-size ratio at-risk / full, per factor: "
+              + ", ".join(f"{r.factor} {r.effect / e:.1f}x"
+                          for r, e in zip(me.itertuples(), me_full.set_index('factor')
+                                          .reindex(me.factor).effect)
+                          if abs(e) > 1e-9))
         print("\n  Pre-registered rule: report effects with intervals; act on the "
               "shrunken\n  estimate, not the argmax. 'Not resolvable' is a result.")
 

@@ -74,6 +74,30 @@ class TrainConfig:
     configs set it explicitly.
     """
 
+    ema_decay: float = 0.8
+    """Per-EPOCH decay for an exponential moving average of the weights.
+
+    Measured motivation, not a convention: epoch-to-epoch macro AP wobbles with
+    sigma ~ 0.0175, which is LARGER than the seed-to-seed sigma of 0.0080, and
+    annealing the learning rate 1.6x changes that bounce by 0.91x -- so it is not
+    step size, it is gradient noise (batch 32 is 1.32% of the corpus, an epoch is
+    77 steps). Selecting the best of ~17 such epochs inflates the reported AP by
+    sigma*sqrt(2 ln 17) ~ 0.042, which exceeds the largest model difference this
+    project has ever resolved.
+
+    An average over the trajectory does not bounce, so there is nothing to
+    select. decay 0.8 gives an effective window of 1/(1-0.8) = 5 epochs, which
+    takes the effective sigma to ~0.0078.
+
+    This is the mechanism Schedule-Free uses, without the optimizer swap: SF
+    evaluates gradients at an interpolation involving the average, so the average
+    feeds back into the trajectory; this averages only for scoring. The
+    benchmarks that put SF-AdamW behind AdamW+cosine at our scale measured the
+    whole SF package, never the averaging in isolation.
+
+    0.0 disables it.
+    """
+
     resume: bool = True
     """Restore from `artifacts/ckpt_last_{arm}_seed{seed}.pt` if one exists.
 
@@ -521,6 +545,29 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
     Y = torch.from_numpy(y)
     A = torch.from_numpy(ar)
 
+    # EMA of the weights, updated once per evaluated epoch. float() copies so
+    # the average is never a view onto live parameters.
+    ema_state: dict | None = None
+    ema_seen = 0
+
+    def _ema_update(sd):
+        nonlocal ema_state, ema_seen
+        d = cfg.ema_decay
+        if ema_state is None:
+            ema_state = {k: v.detach().clone().float() for k, v in sd.items()}
+        else:
+            for k, v in sd.items():
+                if ema_state[k].is_floating_point():
+                    ema_state[k].mul_(d).add_(v.detach().float(), alpha=1 - d)
+                else:
+                    ema_state[k] = v.detach().clone()
+        ema_seen += 1
+        # Bias correction, as in Adam: without it the first epochs are pulled
+        # toward the initialisation and the early EMA scores are meaningless.
+        c = 1 - d ** ema_seen
+        return {k: (v / c if v.is_floating_point() else v)
+                for k, v in ema_state.items()}
+
     fingerprint = _config_fingerprint(cfg, arm, len(vocab))
     ckpt = _ckpt_path(root, arm, cfg.seed)
     start_epoch, step, best = 0, 0, {"macro_ap": -1.0}
@@ -532,6 +579,11 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
     for epoch in range(start_epoch, cfg.epochs):
         model.train()
         tot, nb = 0.0, 0
+        # Trajectory telemetry, accumulated over the epoch. `clip_grad_norm_`
+        # already computes the total norm and we were discarding its return
+        # value, so the single most diagnostic number in the loop was being
+        # thrown away every step.
+        gn_sum, gn_max, n_clipped = 0.0, 0.0, 0
         for rows in bucketed_batches(pack.lengths, tr, cfg.batch_size, rng):
             lr = cfg.lr * (step / warm if step < warm else
                            0.5 * (1 + math.cos(math.pi * (step - warm) /
@@ -550,7 +602,17 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            # The RETURN value is the pre-clip total norm. Keeping it answers a
+            # question the config cannot: is grad_clip=1.0 a live constraint or
+            # dead configuration? If the norm is routinely above the threshold
+            # we are rescaling most updates, which silently changes the
+            # effective learning rate and makes the lr factor mean something
+            # other than what the design thinks it means.
+            gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                                         cfg.grad_clip))
+            gn_sum += gnorm
+            gn_max = max(gn_max, gnorm)
+            n_clipped += int(gnorm > cfg.grad_clip)
             opt.step()
             tot += float(loss); nb += 1; step += 1
 
@@ -567,12 +629,44 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
             Pm = np.where(ar[va].astype(bool), P, 1e-6)
             au, _ = macro_auroc(y[va].astype(int), Pm)
             apv, _ = macro_ap(y[va].astype(int), Pm)
+            # Score the averaged weights on the SAME eval set, then restore.
+            # One extra forward pass per epoch; selection is untouched.
+            ema_au = ema_ap = float("nan")
+            if cfg.ema_decay > 0:
+                live = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                try:
+                    avg = _ema_update(model.state_dict())
+                    model.load_state_dict({k: v.to(live[k].dtype)
+                                           for k, v in avg.items()})
+                    Pe = predict(model, pack.tokens, pack.dt, pack.lengths, va,
+                                 features=feats)
+                    Pem = np.where(ar[va].astype(bool), Pe, 1e-6)
+                    ema_au = macro_auroc(y[va].astype(int), Pem)[0]
+                    ema_ap = macro_ap(y[va].astype(int), Pem)[0]
+                finally:
+                    model.load_state_dict(live)
+
             if verbose:
                 print(f"  epoch {epoch+1:>3}  loss {tot/max(nb,1):.4f}  "
                       f"AUROC {au:.4f}  AP {apv:.4f}  "
+                      f"| EMA AUROC {ema_au:.4f} AP {ema_ap:.4f}  "
                       f"[{(time.time()-t0)/60:.0f} min]", flush=True)
+            # Parameter norm: with weight decay the weights settle toward a
+            # scale, and the update/param ratio is the standard check that the
+            # step size is sane (~1e-3 is the usual healthy band). Neither is
+            # recoverable after the fact, so both are logged per epoch.
+            pnorm = float(sum(float(q.detach().norm()) ** 2
+                              for q in model.parameters()) ** 0.5)
             run.log({"loss": tot / max(nb, 1), "macro_auroc": au,
-                     "macro_ap": apv, "lr": lr}, step=step)
+                     "macro_ap": apv, "lr": lr,
+                     "epoch": epoch + 1,
+                     "grad_norm_mean": gn_sum / max(nb, 1),
+                     "grad_norm_max": gn_max,
+                     "clip_frac": n_clipped / max(nb, 1),
+                     "param_norm": pnorm,
+                     "update_param_ratio": lr * (gn_sum / max(nb, 1)) / max(pnorm, 1e-12),
+                     "ema_macro_auroc": ema_au, "ema_macro_ap": ema_ap,
+                     "minutes": (time.time() - t0) / 60}, step=step)
             # A band, not a bare ">": without it a 1e-6 wobble resets
             # patience and the checkpoint chases evaluation noise.
             improved = apv > best["macro_ap"] + cfg.min_delta

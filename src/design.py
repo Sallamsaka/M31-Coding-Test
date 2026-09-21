@@ -402,6 +402,94 @@ def run_design(root=".", arm="P4", verbose=True):
     return pd.DataFrame(rows)
 
 
+def propose_config(df, metric="macro_ap", shrink_it=True):
+    """Predict the best CELL from the fitted effects, not the best RUN observed.
+
+    W11 asked for this and it was missing: the design reported effects and
+    stopped. Reporting effects answers "what matters"; it does not answer "what
+    should we run", and those are different questions.
+
+    Why not simply take the best observed run: with 16 runs and SE(effect)
+    ~0.0028, the maximum of 16 noisy draws is inflated by
+    sigma*sqrt(2 ln 16) ~ 2.4 sigma. The argmax run is the winner's curse in its
+    purest form. A model fitted to ALL 16 runs uses every run to estimate each
+    effect -- the hidden replication -- so its prediction for a cell is far more
+    stable than that cell's single observation.
+
+    Fits main effects plus all ten two-factor interactions (resolution V makes
+    them unaliased), SHRINKS the coefficients toward zero, then evaluates all 32
+    cells of the full factorial -- including the 16 that were never run, which is
+    the point: a good combination can be predicted without being tried.
+
+    Shrinkage is not optional here. Acting on unshrunken coefficients is exactly
+    "predict the best cell from fitted effects without a significance gate",
+    which the plan names as the thing that manufactures optimism.
+    """
+    import itertools
+    from .effects import shrink
+
+    corners = df[df.kind == "corner"]
+    coded = ["c_" + f for f in FACTORS]
+    X1 = corners[coded].to_numpy(float)
+    y = corners[metric].to_numpy(float)
+
+    pairs = list(itertools.combinations(range(len(coded)), 2))
+    X = np.column_stack([np.ones(len(X1)), X1] +
+                        [X1[:, a] * X1[:, b] for a, b in pairs])
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+
+    if shrink_it:
+        # SE of a COEFFICIENT, from pure error -- not std(y)/sqrt(n), which is
+        # the SE of the mean of y and contains the signal we are trying to
+        # estimate. Using it made tau^2 collapse to 0, shrank every coefficient
+        # to zero, and returned 32 identical predictions.
+        #
+        # Residuals cannot supply sigma here: 16 runs fitting 1 + 5 + 10 = 16
+        # parameters leaves ZERO residual degrees of freedom. The replicated
+        # centre points exist precisely for this, and with orthogonal +-1 coding
+        # SE(coef) = sigma_pure / sqrt(n).
+        centre = df[df.kind == "centre"]
+        if len(centre) >= 2:
+            sigma_pure = float(centre[metric].std(ddof=1))
+        else:                      # no replicates: fall back to Lenth's PSE
+            e = np.abs(beta[1:])
+            s0 = 1.5 * np.median(e)
+            small = e[e < 2.5 * s0] if s0 > 0 else e
+            sigma_pure = (1.5 * np.median(small) * np.sqrt(len(y))) if len(small) else 0.0
+        se = np.full(len(beta) - 1, sigma_pure / np.sqrt(len(y)))
+        # Intercept is not an effect and must not be shrunk toward zero.
+        beta = np.concatenate([beta[:1], shrink(beta[1:], se)])
+
+    grid = np.array(list(itertools.product([-1, 1], repeat=len(coded))), float)
+    G = np.column_stack([np.ones(len(grid)), grid] +
+                        [grid[:, a] * grid[:, b] for a, b in pairs])
+    pred = G @ beta
+
+    out = pd.DataFrame(grid, columns=[f.replace("c_", "") for f in coded])
+    out["predicted"] = pred
+    ran = {tuple(r) for r in X1}
+    out["was_run"] = [tuple(r) in ran for r in grid]
+    return out.sort_values("predicted", ascending=False).reset_index(drop=True)
+
+
+def report_proposal(prop, df, metric):
+    print(f"\n=== BEST-CONFIG PROPOSAL from the fitted, shrunken model ({metric}) ===")
+    cols = [c for c in prop.columns if c not in ("predicted", "was_run")]
+    print(f"{'rank':>5}  " + "  ".join(f"{c:>12}" for c in cols)
+          + f"{'predicted':>12}{'ran?':>7}")
+    for i, r in prop.head(5).iterrows():
+        vals = "  ".join(f"{('high' if r[c] > 0 else 'low'):>12}" for c in cols)
+        print(f"{i+1:>5}  {vals}{r['predicted']:>12.4f}{str(bool(r['was_run'])):>7}")
+    best_obs = df[df.kind == "corner"][metric].max()
+    top = prop.predicted.iloc[0]
+    print(f"\n  best OBSERVED run:  {best_obs:.4f}")
+    print(f"  best PREDICTED cell: {top:.4f}")
+    print(f"  {int((~prop.was_run).sum())} of {len(prop)} cells were never run; "
+          f"{'the top cell is one of them' if not prop.was_run.iloc[0] else 'the top cell was run'}")
+    print("  Predicted, not observed: the maximum of 16 noisy runs is inflated by")
+    print("  ~2.4 sigma, while a fit uses all 16 runs to estimate each effect.")
+
+
 def analyse_design(df, metric="macro_ap"):
     """Main effects from the corners; pure error and curvature from the centre."""
     from .effects import orthogonal_effects, report_orthogonal
@@ -470,12 +558,14 @@ def main() -> None:
         df = pd.read_csv("outputs/design_runs.csv")
         for m in ("macro_ap", "macro_auroc"):
             analyse_design(df, m)
+            report_proposal(propose_config(df, m), df, m)
         return
 
     if a.run:
         df = run_design(".")
         for m in ("macro_ap", "macro_auroc"):
             analyse_design(df, m)
+            report_proposal(propose_config(df, m), df, m)
         return
 
     if a.lr_basin:

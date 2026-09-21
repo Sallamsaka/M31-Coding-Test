@@ -94,22 +94,51 @@ def run_arm(name: str, root: str = ".", verbose: bool = True) -> dict:
     return out
 
 
+def _sigma_single_run():
+    """Measured seed sigma if the replicates have run, else evaluation noise."""
+    led = Path("outputs/design_ledger.jsonl")
+    if led.exists():
+        hit = None
+        for line in led.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                r = json.loads(line)
+                if r.get("event") == "seed_sigma":
+                    hit = r
+        if hit:
+            return float(hit["sigma_auroc"]), (
+                "MEASURED over %d seeds" % hit["n_seeds"])
+    # Evaluation noise only, scaled from the measured 0.0104 at n=365. It
+    # excludes seed and optimisation variance, so it is a LOWER BOUND.
+    return 0.0104 * np.sqrt(365 / 558), "evaluation noise only -- a LOWER BOUND"
+
+
 def report(rows: list[dict]) -> None:
     df = pd.DataFrame(rows).set_index("ablation")
     print("\n=== TIME ABLATION ===")
     print(df[["macro_auroc", "macro_ap", "epoch", "minutes"]]
           .to_string(float_format=lambda v: f"{v:.4f}"))
 
-    # sigma at the 558-patient dev split, scaled from the measured 0.0104 at 365.
-    sigma = 0.0104 * np.sqrt(365 / 558)
-    print(f"\n  sigma(macro AUROC) at dev n=558 ~ {sigma:.4f}; a difference needs "
-          f"~{2*sigma:.4f} to resolve")
+    # sigma of a SINGLE run. Prefer the measured seed sigma when the seed
+    # replicates have run; otherwise fall back to evaluation noise scaled to
+    # the dev split, and SAY SO -- evaluation noise excludes seed and
+    # optimisation variance, so the fallback is a lower bound and every
+    # verdict computed under it is optimistic.
+    sigma, src = _sigma_single_run()
+
+    # These arms are one-run-vs-one-run, so the relevant quantity is the SE
+    # of a DIFFERENCE of two independent runs, sigma*sqrt(2) -- NOT sigma.
+    # Dividing by sigma overstates every verdict by 41%.
+    se_diff = sigma * np.sqrt(2)
+    print(f"\n  sigma(single run) ~ {sigma:.4f}  ({src})")
+    print(f"  SE of an arm-vs-arm difference = sigma*sqrt(2) = {se_diff:.4f}")
+    print(f"  a contrast needs ~{2*se_diff:.4f} to resolve; 80%-power MDE "
+          f"= {2.8*se_diff:.4f}")
 
     def gap(a, b, col="macro_auroc"):
         if a not in df.index or b not in df.index:
             return None
         d = df.loc[a, col] - df.loc[b, col]
-        return d, d / sigma
+        return d, d / se_diff
 
     print("\n  contrasts that answer the design claim:")
     for a, b, what in (

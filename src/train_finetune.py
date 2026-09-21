@@ -344,9 +344,33 @@ def _save_resume(path: Path, *, model, opt, epoch: int, step: int, best: dict,
         "fingerprint": fingerprint,
         "gpt_config": asdict(model.cfg),
     }
-    tmp = path.with_suffix(".tmp")
+    # The temp name carries the PID. Two processes running the SAME experiment
+    # would otherwise write the same `.tmp` and corrupt each other's payload
+    # before either rename -- which is exactly what happened when an orphaned
+    # chain re-ran `--seeds 5` alongside the live one (§D21).
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
     torch.save(payload, tmp)
-    os.replace(tmp, path)
+
+    # os.replace is atomic on POSIX but fails on Windows with WinError 32 if
+    # ANYTHING holds a handle on the destination -- a virus scanner reading the
+    # freshly-written file, or another process writing the same path. Retry,
+    # then give up QUIETLY.
+    #
+    # A checkpoint is insurance. Insurance failing must never destroy the thing
+    # it insures, and the first version of this raised straight through and
+    # killed a 36-minute training run over a file lock.
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.5 * (attempt + 1))
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    print(f"  [warn] could not update {path.name}; training continues without "
+          f"a resume point this epoch", flush=True)
 
 
 def _try_resume(path: Path, *, model, opt, rng, fingerprint: str, verbose: bool):

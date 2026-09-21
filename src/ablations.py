@@ -60,7 +60,12 @@ LEDGER = Path("outputs/ablation_ledger.jsonl")
 
 # Screening capacity, matching the seed-sigma configuration so the measured
 # sigma applies directly to these differences.
-BASE = dict(n_layer=2, n_embd=128, n_head=4, epochs=20, dev_frac=0.2, seed=0)
+# patience, not a hard budget: the arms differ architecturally
+# (bidirectional vs causal, time signals on or off) and those converge at
+# different rates, so a fixed cap would compare a finished arm against an
+# unfinished one and charge the difference to the ablated component.
+BASE = dict(n_layer=2, n_embd=128, n_head=4, epochs=30, patience=4,
+            dev_frac=0.2, holdout_frac=0.1, eval_on="dev", seed=0)
 
 ARMS: dict[str, dict] = {
     "full":            dict(arm="P4", use_time_encoding=True,  use_dt_bias=True),
@@ -84,6 +89,8 @@ def run_arm(name: str, root: str = ".", verbose: bool = True) -> dict:
     r = train(arm, root, cfg, ExampleConfig(), SeqConfig(), verbose=False)
     out = {"ablation": name, "base_arm": arm, **spec,
            "macro_auroc": r["macro_auroc"], "macro_ap": r["macro_ap"],
+           "hold_macro_auroc": r.get("holdout_macro_auroc", float("nan")),
+           "hold_macro_ap": r.get("holdout_macro_ap", float("nan")),
            "epoch": r["epoch"], "minutes": (time.time() - t0) / 60}
     if verbose:
         print(f"  {name:<17} AUROC {out['macro_auroc']:.4f}  AP {out['macro_ap']:.4f}"

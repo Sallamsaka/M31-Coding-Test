@@ -445,6 +445,26 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
             if improved:
                 best = {"epoch": epoch + 1, "macro_auroc": au, "macro_ap": apv,
                         "preds": P.copy()}
+                # The reported score is a MAX over epochs taken on the very set
+                # that selects the epoch, so it carries a winner's curse of the
+                # same shape as the one G1 measures on validation. It is not
+                # common-mode either: a config with a noisier training curve
+                # (high dropout, high lr -- both design factors) gets a larger
+                # max-selection boost, so the bias lands on the contrasts.
+                #
+                # When a holdout exists and is NOT the selection set, score it
+                # at the selected epoch. It informed neither the fit nor the
+                # epoch choice, so `holdout_macro_ap` is clean and the gap to
+                # `macro_ap` is the epoch-selection inflation, MEASURED rather
+                # than argued about.
+                if len(hold) and not np.array_equal(hold, va):
+                    Ph = predict(model, pack.tokens, pack.dt, pack.lengths,
+                                 hold, features=feats)
+                    Phm = np.where(ar[hold].astype(bool), Ph, 1e-6)
+                    best["holdout_macro_auroc"] = macro_auroc(
+                        y[hold].astype(int), Phm)[0]
+                    best["holdout_macro_ap"] = macro_ap(
+                        y[hold].astype(int), Phm)[0]
                 # Checkpoint at the best epoch, not the last. Without this the
                 # reported score belongs to a model that no longer exists by
                 # the end of training, and nothing can be published or

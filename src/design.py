@@ -123,10 +123,15 @@ def seed_sigma(root=".", n_seeds=5, arm="P4", verbose=True) -> dict:
     rows = []
     for s in range(n_seeds):
         t = time.time()
-        cfg = TrainConfig(seed=s, dev_frac=0.2, n_layer=2, n_embd=128, n_head=4,
-                          epochs=20)
+        # patience, not a hard budget -- sigma must be measured under the SAME
+        # stopping protocol the experiments use, or it is the wrong ruler.
+        cfg = TrainConfig(seed=s, dev_frac=0.2, holdout_frac=0.1, eval_on="dev",
+                          n_layer=2, n_embd=128, n_head=4,
+                          epochs=30, patience=4)
         r = train(arm, root, cfg, ExampleConfig(), SeqConfig(), verbose=False)
         rows.append({"seed": s, "auroc": r["macro_auroc"], "ap": r["macro_ap"],
+                     "hold_auroc": r.get("holdout_macro_auroc", float("nan")),
+                     "hold_ap": r.get("holdout_macro_ap", float("nan")),
                      "epoch": r["epoch"], "minutes": (time.time() - t) / 60})
         if verbose:
             print(f"  seed {s}: AUROC {r['macro_auroc']:.4f}  AP {r['macro_ap']:.4f}  "
@@ -141,6 +146,15 @@ def seed_sigma(root=".", n_seeds=5, arm="P4", verbose=True) -> dict:
     }
     # SE of a standard deviation estimated from n draws is ~sigma/sqrt(2(n-1)).
     out["sigma_auroc_rel_se"] = 1 / np.sqrt(2 * (n_seeds - 1))
+    # The CLEAN sigma: holdout informed neither the fit nor the epoch
+    # choice, so it carries no max-over-epochs inflation. If it is
+    # materially larger than the dev sigma, epoch selection is doing more
+    # work than the model is.
+    if df.hold_auroc.notna().any():
+        out["sigma_holdout_auroc"] = float(df.hold_auroc.std(ddof=1))
+        out["mean_holdout_auroc"] = float(df.hold_auroc.mean())
+        out["epoch_selection_inflation"] = float(
+            df.auroc.mean() - df.hold_auroc.mean())
     for N in (16, 20, 32):
         out[f"mde_N{N}"] = 2.8 * 2 * out["sigma_auroc"] / np.sqrt(N)
     df.to_csv("outputs/design_seeds.csv", index=False)
@@ -172,8 +186,15 @@ def lr_basin(root=".", arm="P4", points=(1e-4, 3e-4, 6e-4, 1.2e-3, 2e-3),
     rows = []
     for lr in points:
         t = time.time()
-        cfg = TrainConfig(seed=0, dev_frac=0.2, n_layer=2, n_embd=128, n_head=4,
-                          epochs=20, lr=lr)
+        # A FIXED EPOCH BUDGET WOULD INVALIDATE THIS ENTIRE SWEEP. Learning rate
+        # is precisely the control on convergence speed, so at a hard 20-epoch
+        # cap the low-lr arms are scored before they have finished and the sweep
+        # measures "which lr converges fastest in 20 epochs" rather than "which
+        # lr is best". The basin so found would be biased high -- and it sets
+        # factor A's levels, so the bias would propagate into the whole design.
+        cfg = TrainConfig(seed=0, dev_frac=0.2, holdout_frac=0.1, eval_on="dev",
+                          n_layer=2, n_embd=128, n_head=4,
+                          epochs=40, patience=5, lr=lr)
         r = train(arm, root, cfg, ExampleConfig(), SeqConfig(), verbose=False)
         rows.append({"lr": lr, "auroc": r["macro_auroc"], "ap": r["macro_ap"],
                      "epoch": r["epoch"], "minutes": (time.time() - t) / 60})
@@ -208,6 +229,12 @@ def report_sigma(out: dict) -> None:
     print(f"  macro AUROC {out['mean_auroc']:.4f}, sigma = {s:.4f} "
           f"(+-{100*out['sigma_auroc_rel_se']:.0f}% on {out['n_seeds']} seeds)")
     print(f"  macro AP    {out['mean_ap']:.4f}, sigma = {out['sigma_ap']:.4f}")
+    if "sigma_holdout_auroc" in out:
+        print(f"  CLEAN (holdout, no epoch-selection inflation): "
+              f"AUROC {out['mean_holdout_auroc']:.4f}, "
+              f"sigma = {out['sigma_holdout_auroc']:.4f}")
+        print(f"  epoch-selection inflation (dev - holdout) = "
+              f"{out['epoch_selection_inflation']:+.4f}")
     print("\n  minimum detectable effect at 80% power:")
     for N in (16, 20, 32):
         print(f"    N={N:<3} -> {out[f'mde_N{N}']:.4f} macro AUROC")
@@ -322,7 +349,8 @@ def run_design(root=".", arm="P4", verbose=True):
         # so a fixed budget compares a finished run against an unfinished one.
         # Capacity is a FACTOR here, so that bias would land directly on the
         # effect being estimated.
-        cfg = TrainConfig(seed=r["run"], dev_frac=0.2, epochs=30, patience=4,
+        cfg = TrainConfig(seed=r["run"], dev_frac=0.2, holdout_frac=0.1, eval_on="dev",
+                          epochs=30, patience=4,
                           n_layer=r["n_layer"], n_embd=r["n_embd"],
                           n_head=r["n_head"], lr=r["lr"],
                           weight_decay=r["weight_decay"],
@@ -331,7 +359,12 @@ def run_design(root=".", arm="P4", verbose=True):
         res = train(arm, root, cfg, ExampleConfig(), SeqConfig(), verbose=False)
         row = dict(r)
         row.update({"macro_auroc": res["macro_auroc"],
-                    "macro_ap": res["macro_ap"], "epoch": res["epoch"],
+                    "macro_ap": res["macro_ap"],
+                    "hold_macro_auroc": res.get("holdout_macro_auroc",
+                                               float("nan")),
+                    "hold_macro_ap": res.get("holdout_macro_ap",
+                                            float("nan")),
+                    "epoch": res["epoch"],
                     "minutes": (time.time() - t) / 60})
         rows.append(row)
         if verbose:

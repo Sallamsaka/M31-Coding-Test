@@ -91,7 +91,12 @@ transformer:
   n_embd: 192                       # [C]
   n_head: 6                         # [C]
   d_time: 64                        # [D] Time2Vec, linear term + 63 sinusoids
-  n_dt_buckets: 32                  # [C] arbitrary
+  n_dt_buckets: 10                  # [M] was 32 (copied from T5, tagged "[C] arbitrary").
+                                    # Measured pair occupancy: 8 buckets spanning
+                                    # 0.4-23d held ~2% of attention pairs while ~70%
+                                    # sat in 140-20,000d. Resolution was misplaced,
+                                    # and 32 x n_head scalars is too many free
+                                    # parameters for 2,791 patients.
   max_dt_days: 40000                # [M] the largest observed dt is 37,284
   epochs: 20
   batch_size: 32                    # [C]

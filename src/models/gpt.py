@@ -52,7 +52,13 @@ class GPTConfig:
     n_head: int = 6
     n_embd: int = 192
     d_time: int = 64             # width of the continuous time encoding
-    n_dt_buckets: int = 32       # log-spaced buckets for the pairwise bias
+    n_dt_buckets: int = 10       # log-spaced buckets for the pairwise bias
+    # Was 32, copied from T5 including the count. T5's 32 comes from a
+    # 10^11-token regime; here it means n_head x 32 free scalars fitted on
+    # 2,791 patients. Measured occupancy over 150 sampled patients: eight
+    # buckets spanning 0.4-23 days hold ~2% of all attention pairs between
+    # them, while ~70% of the mass sits in the 140-20,000 day range. The
+    # resolution was in the wrong place, not merely excessive.
     max_dt_days: float = 40000.0 # top bucket edge; measured max Δt is 37,284
     n_outputs: int = 41          # 40 scored conditions + 5-year death
     attn_dropout: float = 0.1    # DropKey-style; measured 5x larger gain at small n
@@ -123,7 +129,26 @@ class TimeEncoding(nn.Module):
         assert d_time >= 2
         # Spread initial frequencies over the log-day range so some components
         # resolve days and others resolve decades.
-        w = torch.exp(torch.linspace(math.log(0.05), math.log(3.0), d_time - 1))
+        # Band chosen so every component is periodic over the OBSERVED range of
+        # u = log(1+dt), which spans [0, 10.28].
+        #
+        # Floor 0.6: one full cycle needs omega = 2*pi/10.28 = 0.611. The old
+        # floor of 0.05 gave a period of 125.7 in u-units, so 38 of 63
+        # components completed less than one cycle across the entire dataset --
+        # quasi-linear at init, and therefore redundant with the explicit
+        # linear term on the next line. 60% of the basis was doing nothing the
+        # linear term was not already doing.
+        #
+        # Ceiling 8.0: the log transform sets a resolution limit. At the recent
+        # end u(2)-u(1) = 0.405, so the finest resolvable frequency is about
+        # pi/0.405 = 7.8; past that, adjacent days alias. The old ceiling of 3.0
+        # left the top of the expressible band unused.
+        #
+        # Tancik et al. (2020) is the established mechanism: performance vs the
+        # frequency scale is a broad plateau with sharp cliffs at both ends, and
+        # the scale matters far more than the number of features -- so this band
+        # is a hyperparameter to sweep, not a constant to trust.
+        w = torch.exp(torch.linspace(math.log(0.6), math.log(8.0), d_time - 1))
         self.w = nn.Parameter(w)
         self.a = nn.Parameter(torch.rand(d_time - 1) * 2 * math.pi)
         self.w0 = nn.Parameter(torch.tensor(0.3))

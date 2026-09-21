@@ -461,17 +461,24 @@ def _try_resume(path: Path, *, model, opt, rng, fingerprint: str, verbose: bool)
                   flush=True)
         return fresh
     if ck.get("fingerprint") != fingerprint:
-        if verbose:
-            print("  resume: checkpoint is for a DIFFERENT configuration; "
-                  "ignoring it and starting fresh", flush=True)
+        print(f"  resume: {path.name} is for a DIFFERENT configuration; "
+              "ignoring it and starting fresh", flush=True)
         return fresh
     model.load_state_dict(ck["model"])
     opt.load_state_dict(ck["opt"])
     torch.set_rng_state(ck["torch_rng"])
     rng.bit_generator.state = ck["numpy_rng"]
-    if verbose:
-        print(f"  RESUMED from epoch {ck['epoch']} (step {ck['step']:,}), "
-              f"best AP so far {ck['best'].get('macro_ap', -1):.4f}", flush=True)
+    # ALWAYS announced, regardless of `verbose`. A resume is not progress
+    # chatter, it is provenance: it changes what the run IS. Behind `if verbose`
+    # it was silent for every ablation arm and every design run, which are the
+    # exact places a wrong resume does the most damage -- and one did. Two arms
+    # sharing a fingerprint shared a checkpoint slot, one silently continued the
+    # other's training, and the only visible symptom was that two arms failed to
+    # reproduce across attempts while an arm with a unique fingerprint was
+    # bit-identical.
+    print(f"  RESUMED {path.name} from epoch {ck['epoch']} "
+          f"(step {ck['step']:,}), best AP so far "
+          f"{ck['best'].get('macro_ap', -1):.4f}", flush=True)
     return ck["epoch"], ck["step"], ck["best"]
 
 

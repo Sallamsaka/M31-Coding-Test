@@ -214,3 +214,40 @@ def test_ema_decay_controls_the_averaging_window():
             v = e.update({"a": torch.tensor([1.0])})["a"].item()
         resp[d] = v
     assert resp[0.5] > resp[0.9], resp
+
+
+def test_a_resume_is_announced_even_when_verbose_is_off(tmp_path, capsys):
+    """A resume changes what the run IS, so it is provenance, not chatter.
+
+    Behind `if verbose:` it was silent for every ablation arm and every design
+    run -- exactly where a wrong resume does the most damage. One did: two arms
+    shared a fingerprint, so they shared a checkpoint slot, and one silently
+    continued the other's training. The only visible symptom was that those two
+    arms failed to reproduce across attempts while an arm with a unique
+    fingerprint was bit-identical.
+    """
+    m, opt = _tiny()
+    path = tmp_path / "ck.pt"
+    _save_resume(path, model=m, opt=opt, epoch=7, step=77, best={"macro_ap": 0.3},
+                 rng=np.random.default_rng(0), fingerprint="fp")
+    m2, opt2 = _tiny()
+    capsys.readouterr()
+    _try_resume(path, model=m2, opt=opt2, rng=np.random.default_rng(0),
+                fingerprint="fp", verbose=False)
+    out = capsys.readouterr().out
+    assert "RESUMED" in out and "epoch 7" in out, out
+
+
+def test_a_refused_checkpoint_is_announced_too(tmp_path, capsys):
+    """Silently ignoring a checkpoint is the other half of the same blind spot:
+    a run that should have resumed and did not is also worth knowing about."""
+    m, opt = _tiny()
+    path = tmp_path / "ck.pt"
+    _save_resume(path, model=m, opt=opt, epoch=3, step=33, best={},
+                 rng=np.random.default_rng(0), fingerprint="config-A")
+    m2, opt2 = _tiny()
+    capsys.readouterr()
+    _try_resume(path, model=m2, opt=opt2, rng=np.random.default_rng(0),
+                fingerprint="config-B", verbose=False)
+    out = capsys.readouterr().out
+    assert "DIFFERENT configuration" in out, out

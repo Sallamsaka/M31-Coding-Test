@@ -94,7 +94,7 @@ def main() -> None:
     a = ap_.parse_args()
 
     print("min-history floor sweep -- augmentation, scored on REAL cutoffs only")
-    print(f"  real-cutoff median pre-cutoff events = 189; C1 ran at floor 10\n")
+    print("  real-cutoff median pre-cutoff events = 189; C1 ran at floor 10\n")
     print(f"{'floor':>7}{'rows':>9}{'synthetic':>11}{'macro AUROC':>20}{'macro AP':>20}")
 
     rows = []

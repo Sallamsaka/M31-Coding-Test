@@ -64,8 +64,14 @@ LEDGER = Path("outputs/ablation_ledger.jsonl")
 # (bidirectional vs causal, time signals on or off) and those converge at
 # different rates, so a fixed cap would compare a finished arm against an
 # unfinished one and charge the difference to the ablated component.
+# min_delta=0.002 is the patience BAND, set from measurement rather than
+# taste: the observed epoch-to-epoch AP increments on the collapse run's
+# plateau were +0.0010 and +0.0033, so 0.002 sits between them and filters
+# pure wobble while still admitting a real gain. Provisional -- it should be
+# re-derived from the sigma_ap that `design --seeds` measures.
 BASE = dict(n_layer=2, n_embd=128, n_head=4, epochs=30, patience=4,
-            dev_frac=0.2, holdout_frac=0.1, eval_on="dev", seed=0)
+            min_delta=0.002, dev_frac=0.2, holdout_frac=0.1,
+            eval_on="dev", seed=0)
 
 ARMS: dict[str, dict] = {
     "full":            dict(arm="P4", use_time_encoding=True,  use_dt_bias=True),

@@ -60,6 +60,29 @@ class TrainConfig:
     pretrain_epochs: int = 8
     eval_every: int = 1
 
+    min_delta: float = 0.0
+    """How much dev AP must IMPROVE to count as an improvement.
+
+    Without a band, `apv > best` counts a 1e-6 wobble as progress, which resets
+    the patience counter and means patience effectively never fires on a noisy
+    plateau -- we keep paying for epochs that are chasing evaluation noise, and
+    the checkpoint lands on whichever noise peak happened to be highest.
+
+    The band should be set from the measured epoch-to-epoch noise in the metric,
+    which is what `design --seeds` reports as `sigma_ap`. Until that is measured
+    it stays 0.0, preserving the original behaviour exactly, and the experiment
+    configs set it explicitly.
+    """
+
+    resume: bool = True
+    """Restore from `artifacts/ckpt_last_{arm}_seed{seed}.pt` if one exists.
+
+    The checkpoint is written every eval epoch and deleted on clean completion,
+    so one only exists if a run died. It carries optimiser moments, the step
+    counter and the RNG states, so a resumed run continues the cosine schedule
+    and the batch order rather than silently restarting them.
+    """
+
     patience: int = 0
     """Stop after this many epochs with no improvement in validation AP.
     0 disables it and `epochs` becomes a hard budget.
@@ -281,6 +304,78 @@ def inner_split_pids(root: str | Path, dev_frac: float, holdout_frac: float,
             set(order[n_dev:n_dev + n_hold].tolist()))
 
 
+def _ckpt_path(root, arm: str, seed: int) -> Path:
+    return Path(root) / "artifacts" / f"ckpt_last_{arm}_seed{seed}.pt"
+
+
+def _config_fingerprint(cfg: "TrainConfig", arm: str, vocab_size: int) -> str:
+    """What a resume must match. Resuming into a different architecture would
+    load the wrong tensors; resuming into a different schedule would continue a
+    cosine curve computed for a different horizon. Both fail silently, so the
+    fingerprint is checked rather than trusted."""
+    import hashlib
+    keys = ("n_layer", "n_embd", "n_head", "attn_dropout", "resid_dropout",
+            "fusion", "fusion_dim", "lr", "weight_decay", "epochs",
+            "batch_size", "warmup_frac", "seed", "dev_frac", "holdout_frac",
+            "use_time_encoding", "use_dt_bias")
+    blob = "|".join(f"{k}={getattr(cfg, k)}" for k in keys)
+    blob += f"|arm={arm}|vocab={vocab_size}"
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def _save_resume(path: Path, *, model, opt, epoch: int, step: int, best: dict,
+                 rng, fingerprint: str) -> None:
+    """Write the FULL training state, atomically.
+
+    Atomically because the entire point is surviving a run that died: a plain
+    torch.save interrupted mid-write leaves a truncated file that cannot be
+    loaded, which is precisely the situation the checkpoint exists for. Write to
+    a temp file, then os.replace, which is atomic on both POSIX and Windows.
+    """
+    import os
+    path.parent.mkdir(exist_ok=True)
+    payload = {
+        "model": model.state_dict(),
+        "opt": opt.state_dict(),
+        "epoch": epoch, "step": step,
+        "best": {k: v for k, v in best.items()},
+        "torch_rng": torch.get_rng_state(),
+        "numpy_rng": rng.bit_generator.state,
+        "fingerprint": fingerprint,
+        "gpt_config": asdict(model.cfg),
+    }
+    tmp = path.with_suffix(".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _try_resume(path: Path, *, model, opt, rng, fingerprint: str, verbose: bool):
+    """Returns (start_epoch, step, best) -- (0, 0, fresh) if no usable state."""
+    fresh = (0, 0, {"macro_ap": -1.0})
+    if not path.exists():
+        return fresh
+    try:
+        ck = torch.load(path, weights_only=False)
+    except Exception as e:                      # truncated or unreadable
+        if verbose:
+            print(f"  resume: checkpoint unreadable ({e}); starting fresh",
+                  flush=True)
+        return fresh
+    if ck.get("fingerprint") != fingerprint:
+        if verbose:
+            print("  resume: checkpoint is for a DIFFERENT configuration; "
+                  "ignoring it and starting fresh", flush=True)
+        return fresh
+    model.load_state_dict(ck["model"])
+    opt.load_state_dict(ck["opt"])
+    torch.set_rng_state(ck["torch_rng"])
+    rng.bit_generator.state = ck["numpy_rng"]
+    if verbose:
+        print(f"  RESUMED from epoch {ck['epoch']} (step {ck['step']:,}), "
+              f"best AP so far {ck['best'].get('macro_ap', -1):.4f}", flush=True)
+    return ck["epoch"], ck["step"], ck["best"]
+
+
 def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = None,
           ex_cfg: ExampleConfig | None = None, seq_cfg: SeqConfig | None = None,
           max_steps: int | None = None, verbose: bool = True) -> dict:
@@ -396,8 +491,16 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
 
     Y = torch.from_numpy(y)
     A = torch.from_numpy(ar)
-    step, t0, best = 0, time.time(), {"macro_ap": -1.0}
-    for epoch in range(cfg.epochs):
+
+    fingerprint = _config_fingerprint(cfg, arm, len(vocab))
+    ckpt = _ckpt_path(root, arm, cfg.seed)
+    start_epoch, step, best = 0, 0, {"macro_ap": -1.0}
+    if cfg.resume and max_steps is None:
+        start_epoch, step, best = _try_resume(
+            ckpt, model=model, opt=opt, rng=rng, fingerprint=fingerprint,
+            verbose=verbose)
+    t0 = time.time()
+    for epoch in range(start_epoch, cfg.epochs):
         model.train()
         tot, nb = 0.0, 0
         for rows in bucketed_batches(pack.lengths, tr, cfg.batch_size, rng):
@@ -441,7 +544,9 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
                       f"[{(time.time()-t0)/60:.0f} min]", flush=True)
             run.log({"loss": tot / max(nb, 1), "macro_auroc": au,
                      "macro_ap": apv, "lr": lr}, step=step)
-            improved = apv > best["macro_ap"]
+            # A band, not a bare ">": without it a 1e-6 wobble resets
+            # patience and the checkpoint chases evaluation noise.
+            improved = apv > best["macro_ap"] + cfg.min_delta
             if improved:
                 best = {"epoch": epoch + 1, "macro_auroc": au, "macro_ap": apv,
                         "preds": P.copy()}
@@ -477,6 +582,13 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
                                 "epoch": epoch + 1, "vocab_size": len(vocab),
                                 "val_macro_auroc": au, "val_macro_ap": apv},
                                f"artifacts/model_{arm}_seed{cfg.seed}.pt")
+
+            # Resume state EVERY eval epoch, improved or not -- an interrupted
+            # run must restart from where it stopped, not from its best epoch.
+            if max_steps is None:
+                _save_resume(ckpt, model=model, opt=opt, epoch=epoch + 1,
+                             step=step, best=best, rng=rng,
+                             fingerprint=fingerprint)
         if max_steps is not None and step >= max_steps:
             break
         if cfg.patience > 0 and (epoch + 1) - best.get("epoch", 0) >= cfg.patience:
@@ -488,6 +600,11 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
 
     run.summary(best_macro_ap=best["macro_ap"], best_macro_auroc=best["macro_auroc"])
     run.finish()
+    # Clean completion: drop the resume state so it cannot be mistaken for a
+    # crashed run later, and so 20 design runs do not leave 20 x ~25 MB behind.
+    if max_steps is None:
+        ckpt.unlink(missing_ok=True)
+
     return {"arm": arm, "seed": cfg.seed, **{k: v for k, v in best.items()
                                              if k != "preds"},
             "preds": best.get("preds"), "epochs_run": epoch + 1,

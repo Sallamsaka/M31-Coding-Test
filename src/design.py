@@ -127,7 +127,7 @@ def seed_sigma(root=".", n_seeds=5, arm="P4", verbose=True) -> dict:
         # stopping protocol the experiments use, or it is the wrong ruler.
         cfg = TrainConfig(seed=s, dev_frac=0.2, holdout_frac=0.1, eval_on="dev",
                           n_layer=2, n_embd=128, n_head=4,
-                          epochs=30, patience=4)
+                          epochs=30, patience=4, min_delta=0.002)
         r = train(arm, root, cfg, ExampleConfig(), SeqConfig(), verbose=False)
         rows.append({"seed": s, "auroc": r["macro_auroc"], "ap": r["macro_ap"],
                      "hold_auroc": r.get("holdout_macro_auroc", float("nan")),
@@ -194,7 +194,7 @@ def lr_basin(root=".", arm="P4", points=(1e-4, 3e-4, 6e-4, 1.2e-3, 2e-3),
         # factor A's levels, so the bias would propagate into the whole design.
         cfg = TrainConfig(seed=0, dev_frac=0.2, holdout_frac=0.1, eval_on="dev",
                           n_layer=2, n_embd=128, n_head=4,
-                          epochs=40, patience=5, lr=lr)
+                          epochs=40, patience=5, min_delta=0.002, lr=lr)
         r = train(arm, root, cfg, ExampleConfig(), SeqConfig(), verbose=False)
         rows.append({"lr": lr, "auroc": r["macro_auroc"], "ap": r["macro_ap"],
                      "epoch": r["epoch"], "minutes": (time.time() - t) / 60})
@@ -350,7 +350,7 @@ def run_design(root=".", arm="P4", verbose=True):
         # Capacity is a FACTOR here, so that bias would land directly on the
         # effect being estimated.
         cfg = TrainConfig(seed=r["run"], dev_frac=0.2, holdout_frac=0.1, eval_on="dev",
-                          epochs=30, patience=4,
+                          epochs=30, patience=4, min_delta=0.002,
                           n_layer=r["n_layer"], n_embd=r["n_embd"],
                           n_head=r["n_head"], lr=r["lr"],
                           weight_decay=r["weight_decay"],

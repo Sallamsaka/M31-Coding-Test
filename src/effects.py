@@ -87,9 +87,43 @@ def paired_effects(df: pd.DataFrame, factors: list[str], metric: str,
             w = sub.pivot_table(index=others, columns=f, values=metric)
             if w.shape[1] == 2:
                 pf.append(float((w[hi_lvl] - w[lo_lvl]).mean()))
-        out.append({"factor": f, "effect": eff, "se": se, "t": t, "p_onesided": p,
-                    "n_pairs": n, "sigma": abs(t) if se > 0 else np.nan,
-                    "fold_spread": float(np.std(pf, ddof=1)) if len(pf) > 1 else np.nan})
+        # TWO uncertainties, because they answer different questions and the
+        # first one alone is badly misleading. Measured on the real factorial:
+        # 0.000018 against 0.000164, a factor of NINE.
+        #
+        #   se_config -- across matched configuration pairs. Patients and folds
+        #     are held fixed, so patient-sampling noise cancels ENTIRELY in the
+        #     pairing. This measures how CONSISTENT the effect is across
+        #     configurations, NOT whether it would replicate on new patients.
+        #     Quoting it as the interval implies a generalisation claim it
+        #     cannot support.
+        #
+        #   se_fold -- across folds, each scored on different held-out patients,
+        #     so it does carry patient-sampling variation. Corrected by
+        #     Nadeau & Bengio (2003): K-fold training sets overlap in
+        #     (K-2)/(K-1) of their patients, so the naive 1/K variance is
+        #     anticonservative and the corrected factor is 1/K + n_test/n_train.
+        #     Still only K-1 degrees of freedom, so it is noisy in its own right.
+        #
+        # The reported interval uses the LARGER of the two. Neither is exactly
+        # right -- that needs a patient-level bootstrap of the OOF predictions,
+        # which requires storing them -- but se_config is a lower bound and
+        # quoting the larger is the conservative choice.
+        n_folds = len(pf)
+        if n_folds > 1:
+            nb = np.sqrt((1 / n_folds + 1 / (n_folds - 1)) / (1 / n_folds))
+            se_fold = float(np.std(pf, ddof=1) / np.sqrt(n_folds) * nb)
+        else:
+            se_fold = np.nan
+        se_rep = max(se, se_fold) if np.isfinite(se_fold) else se
+        t_rep = eff / se_rep if se_rep > 0 else np.nan
+        out.append({"factor": f, "effect": eff,
+                    "se": se_rep, "se_config": se, "se_fold": se_fold,
+                    "t": t_rep,
+                    "p_onesided": float(stats.t.sf(t_rep, df=max(n_folds - 1, 1)))
+                    if se_rep > 0 else np.nan,
+                    "n_pairs": n, "sigma": abs(t_rep) if se_rep > 0 else np.nan,
+                    "fold_spread": float(np.std(pf, ddof=1)) if n_folds > 1 else np.nan})
 
     res = pd.DataFrame(out)
     if res.empty:
@@ -131,16 +165,18 @@ def report(res: pd.DataFrame, metric: str, q: float = 0.15) -> None:
         print("  no two-level factors to contrast")
         return
     print(f"\n=== MAIN EFFECTS on {metric} (paired contrasts) ===")
-    cols = ["factor", "effect", "ci_lo", "ci_hi", "se", "sigma",
-            "p_onesided", "q_bh", "shrunken", "n_pairs"]
+    cols = ["factor", "effect", "ci_lo", "ci_hi", "se", "se_config", "se_fold",
+            "sigma", "p_onesided", "q_bh", "shrunken", "n_pairs"]
+    cols = [c for c in cols if c in res.columns]
     print(res[cols].to_string(index=False, float_format=lambda v: f"{v:+.5f}"))
     k = int(res.passes_bh.sum())
     print(f"\n  {k}/{len(res)} pass one-sided BH at q={q}. "
           f"Act on `shrunken`, not on `effect`, and not on this column.")
-    worst = res.fold_spread.max()
-    if np.isfinite(worst):
-        print(f"  largest across-fold spread of any effect: {worst:.5f} "
-              f"(diagnostic; folds share training data so this is not an SE)")
+    if "se_config" in res.columns and res.se_config.gt(0).any():
+        ratio = (res.se_fold / res.se_config).replace([np.inf, -np.inf], np.nan)
+        print(f"  se_fold / se_config ranges {ratio.min():.0f}x to "
+              f"{ratio.max():.0f}x. se_config holds patients AND folds fixed,")
+        print("  so it cannot speak to generalisation; the interval uses the larger.")
 
 
 # ---------------------------------------------------------------------------

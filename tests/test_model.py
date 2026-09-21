@@ -54,7 +54,13 @@ def test_forward_and_lm_forward_are_finite(model, batch):
     tokens, dt, lengths = batch
     with torch.no_grad():
         out, lm = model(tokens, dt, lengths), model.lm_forward(tokens, dt)
-    assert out.shape == (len(tokens), 41)
+    # Asserted against the config, not a literal. These pinned 41, which no
+    # trained model has ever had: train() builds every model with
+    # n_outputs=y.shape[1] and the label array has 40 columns, so the 41st
+    # head was dead code and these tests were guarding a shape that only
+    # existed in the default. Reading it from the config means the test
+    # follows a deliberate change and still catches an accidental one.
+    assert out.shape == (len(tokens), model.cfg.n_outputs)
     assert lm.shape == (*tokens.shape, VOCAB)
     # The strict mask hides everything at the current instant, so the first
     # position sees only itself. Without the diagonal added back its softmax
@@ -134,7 +140,13 @@ def test_both_coherent_arms_run_and_stay_finite(batch, causal, readout):
                                      readout=readout)).eval()
     with torch.no_grad():
         out = m(tokens, dt, lengths)
-    assert out.shape == (len(tokens), 41)
+    # Asserted against the config, not a literal. These pinned 41, which no
+    # trained model has ever had: train() builds every model with
+    # n_outputs=y.shape[1] and the label array has 40 columns, so the 41st
+    # head was dead code and these tests were guarding a shape that only
+    # existed in the default. Reading it from the config means the test
+    # follows a deliberate change and still catches an accidental one.
+    assert out.shape == (len(tokens), m.cfg.n_outputs)
     assert torch.isfinite(out).all()
 
 

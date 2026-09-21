@@ -77,7 +77,21 @@ LEDGER = Path("outputs/design_ledger.jsonl")
 FACTORS = {
     "lr":           (None, None),      # filled from the 1-D basin sweep
     "weight_decay": (1e-3, 0.3),
-    "capacity":     ((1, 128, 4), (4, 192, 6)),   # (n_layer, n_embd, n_head)
+    # (n_layer, n_embd, n_head). Head dim is 32 at BOTH levels and at the
+    # centre, so this contrast is pure capacity and not a head-dim change.
+    #
+    # The range was 1L/128 -> 4L/192 and is shifted DOWN, for a reason and not
+    # only for cost. Delphi-2M swept 486 models and found ~2M parameters optimal
+    # at 400,799 patients; running that scaling backwards to 2,791 patients
+    # implies an optimum one to two orders of magnitude SMALLER than our 2.04M
+    # default (§R3). §E13 points the same way -- the median label supports 10.5
+    # parameters and we feed 3,320 -- and §E17 found every feature block null,
+    # which is what capacity saturation looks like. So the live question is
+    # "are we far too big?", and that is answered by testing downward.
+    #
+    # Cost mattered too, and honestly: the eight 4L/192 corners were 23 h of a
+    # 29.6 h design, to test a direction the evidence already argues against.
+    "capacity":     ((1, 64, 2), (2, 128, 4)),
     # One knob, driving BOTH TrainConfig.attn_dropout and .resid_dropout. They
     # are separate fields but were never varied independently, and splitting
     # them would spend a column of the design on a distinction nothing has
@@ -257,7 +271,7 @@ def report_sigma(out: dict) -> None:
 # which makes the curvature test valid only within the fusion="none" half.
 # Stated rather than buried; it is the price of putting a categorical factor
 # into a design that carries centre points.
-CENTRE_CAPACITY = (2, 160, 5)     # n_embd / n_head = 32, as at both corners
+CENTRE_CAPACITY = (1, 96, 3)      # n_embd / n_head = 32, as at both corners
 
 
 def _read_ledger(event):

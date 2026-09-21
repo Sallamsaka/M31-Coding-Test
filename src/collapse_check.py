@@ -32,6 +32,21 @@ patients, wider on a 558-patient dev split):
   the tabular branch is redundant.
 * both large -> genuine fusion; proceed.
 
+**Pre-registered reading, fixed before the result was seen.** This trains for 12
+epochs, and the search ledger's runs needed 14-20 to peak. An undertrained model
+also shows a small shuffle-drop -- the sequence branch has not learned yet -- and
+that is a *different* diagnosis from collapse with the opposite action (train
+longer vs. change the training objective). The two are separated by the intact
+dev AUROC, which must be read first:
+
+* intact dev AUROC ~0.74-0.76 (the known non-fused P4 range) -> the model is
+  trained, and a small shuffle-drop means **collapse**.
+* intact dev AUROC materially below that -> **undertrained**, the verdict below
+  is void, and the rerun is at more epochs, not a training-objective change.
+
+The VERDICT line printed at the end does not know about this distinction, so it
+must not be quoted without the intact AUROC beside it.
+
 Run: ``python -m src.collapse_check``
 """
 

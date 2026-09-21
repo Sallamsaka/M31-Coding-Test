@@ -42,7 +42,6 @@ import argparse
 import os
 import time
 
-import numpy as np
 import pandas as pd
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")   # must precede the BLAS import
@@ -57,7 +56,6 @@ BLOCKS = ("enable_reason", "enable_slope", "enable_time_since",
 
 def _score_one(root, fold_i, fit_rows, oof_rows, block_flags, dedup, C, windows=None):
     """One (config, fold, C) cell. Returns a row dict."""
-    import numpy as np
     from .data.examples import ExampleConfig
     from .data.features import FeatureConfig, build_features
     from .data.labels import at_risk_mask, load_labels
@@ -102,18 +100,17 @@ def run_factorial(root=".", quick=False) -> pd.DataFrame:
 
 
 def main_effects(df: pd.DataFrame, metric: str = "auroc") -> pd.DataFrame:
-    """Contrast of on-vs-off for each factor, averaged over everything else."""
-    out = []
-    per_cfg = df.groupby(list(BLOCKS) + ["dedup", "C"])[metric].mean().reset_index()
-    for f in list(BLOCKS) + ["dedup"]:
-        hi = per_cfg.loc[per_cfg[f], metric]
-        lo = per_cfg.loc[~per_cfg[f], metric]
-        eff = hi.mean() - lo.mean()
-        se = np.sqrt(hi.var(ddof=1) / len(hi) + lo.var(ddof=1) / len(lo))
-        out.append({"factor": f, "effect": eff, "se": se,
-                    "sigma": abs(eff) / se if se > 0 else np.nan,
-                    "n_hi": len(hi), "n_lo": len(lo)})
-    return pd.DataFrame(out).sort_values("sigma", ascending=False)
+    """Paired on-vs-off contrast per factor. See `src/effects.py` for why paired.
+
+    The first version of this used an unpaired two-sample SE across
+    configurations. Every f=1 configuration here has an exact twin at f=0, so
+    that SE charged the contrast for all the between-configuration variance the
+    other factors contribute. Measured on simulated tables at this project's own
+    effect magnitudes, the unpaired SE is **1.7-2.1x too wide** -- the difference
+    between resolving a 0.004 block effect and calling it noise.
+    """
+    from .effects import paired_effects
+    return paired_effects(df, list(BLOCKS) + ["dedup"], metric, fold_col="fold")
 
 
 def main() -> None:
@@ -131,9 +128,9 @@ def main() -> None:
           f"macro AP {g.ap.mean():.4f} +- {g.ap.std(ddof=1):.4f}   (over {len(g)} folds)")
 
     if not a.quick:
-        print("\n=== MAIN EFFECTS on macro AUROC ===")
+        from .effects import report
         me = main_effects(df, "auroc")
-        print(me.to_string(index=False, float_format=lambda v: f"{v:.5f}"))
+        report(me, "macro AUROC")
         me.to_csv("outputs/lr_main_effects.csv", index=False)
         print("\n  Pre-registered rule: report effects with intervals; act on the "
               "shrunken\n  estimate, not the argmax. 'Not resolvable' is a result.")

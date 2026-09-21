@@ -38,3 +38,5 @@ __pycache__/
 # order rather than part of the pipeline.
 run_lr_chain.sh
 run_tx_chain.sh
+
+run_design_chain.sh

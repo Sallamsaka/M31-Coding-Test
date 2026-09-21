@@ -305,7 +305,13 @@ def run_design(root=".", arm="P4", verbose=True):
         # The training seed VARIES with the run (Bouthillier et al. 2021): a
         # fixed seed makes sigma cosmetically small and the conclusions
         # seed-specific. The SPLIT seed 12345 stays fixed -- a different thing.
-        cfg = TrainConfig(seed=r["run"], dev_frac=0.2, epochs=20,
+        # patience > 0, NOT a hard epoch budget. TrainConfig.patience's own
+        # docstring records why: at a fixed cap the 1-layer configs peaked at
+        # epochs 19-20 still improving while 2-layer/dropout-0.3 peaked at 14,
+        # so a fixed budget compares a finished run against an unfinished one.
+        # Capacity is a FACTOR here, so that bias would land directly on the
+        # effect being estimated.
+        cfg = TrainConfig(seed=r["run"], dev_frac=0.2, epochs=30, patience=4,
                           n_layer=r["n_layer"], n_embd=r["n_embd"],
                           n_head=r["n_head"], lr=r["lr"],
                           weight_decay=r["weight_decay"],

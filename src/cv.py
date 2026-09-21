@@ -46,7 +46,8 @@ from .data.cohort import load_cohort
 from .data.examples import ExampleConfig, grouped_folds, load_examples
 
 __all__ = ["SPLIT_SEED", "LOCKED_TEST_FRAC", "LOCKED_TEST_N", "locked_test_pids",
-           "cv_pool_pids", "fold_masks", "main"]
+           "cv_pool_pids", "trainable_pids", "trainable_row_mask",
+           "fold_masks", "main"]
 
 # The one permutation everything in this project derives a split from.
 # Deliberately not cfg.seed: every configuration ever compared must see the
@@ -89,6 +90,26 @@ def cv_pool_pids(root: str = ".", frac: float = LOCKED_TEST_FRAC) -> np.ndarray:
     pids = _train_pids(root)
     locked = locked_test_pids(root, frac)
     return np.sort(np.array([p for p in pids if p not in locked]))
+
+
+def trainable_pids(root: str = ".", frac: float = LOCKED_TEST_FRAC) -> set[int]:
+    """Train patients MINUS the locked test set -- what any fit may legally see.
+
+    This is the default universe for every fit in the project, not a
+    cross-validation detail. `split == "train"` is 2,791 patients and **includes
+    the locked 358**, so using it as a fit mask trains on the set carved to be
+    the honest final estimate. Measured before this existed: the locked patients
+    were 12.8% of every default fit set, and the only path that excluded them
+    was `fold_masks`.
+    """
+    return set(cv_pool_pids(root, frac).tolist())
+
+
+def trainable_row_mask(ex, root: str = ".", frac: float = LOCKED_TEST_FRAC):
+    """Row mask over an example frame: train rows whose patient is not locked."""
+    pool = trainable_pids(root, frac)
+    is_train = (ex.split == "train").to_numpy()
+    return is_train & np.isin(ex.pid.to_numpy(), list(pool))
 
 
 def fold_masks(root: str = ".", n_splits: int = 5, repeat: int = 0,

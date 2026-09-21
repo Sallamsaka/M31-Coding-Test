@@ -102,7 +102,13 @@ def _fit_rows(F: FeatureMatrix, fit_mask: np.ndarray | None) -> np.ndarray:
     here rather than a convention every caller has to remember.
     """
     if fit_mask is None:
-        return F.split == "train"
+        # Default excludes the locked test set (cv.trainable_pids). It used to
+        # return `F.split == "train"`, which is 2,791 rows INCLUDING the locked
+        # 358 -- so run_baseline, the path that ships predictions.csv, trained
+        # on the held-out set.
+        from .cv import trainable_pids
+        pool = trainable_pids()
+        return (F.split == "train") & np.isin(F.pid, list(pool))
     m = np.asarray(fit_mask, bool)
     assert m.shape == (len(F.split),), (
         f"fit_mask {m.shape} does not match {len(F.split)} rows")

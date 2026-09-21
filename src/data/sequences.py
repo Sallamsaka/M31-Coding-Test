@@ -149,7 +149,12 @@ def build_vocab(root: Path | str = ".", cfg: SeqConfig | None = None,
 
     allowed = set(cohort.loc[cohort.split == "train", "pid"])
     if fit_pids is None:
-        train_pids = allowed
+        # Default excludes the locked test set -- see cv.trainable_pids. The
+        # vocabulary decides which codes clear `min_patients_per_code` and where
+        # the decile edges fall, so building it on the locked patients is the
+        # same class of leak as D17, one level up.
+        from ..cv import trainable_pids
+        train_pids = trainable_pids(str(root))
     else:
         train_pids = {int(x) for x in fit_pids}
         assert train_pids, "empty fit_pids"

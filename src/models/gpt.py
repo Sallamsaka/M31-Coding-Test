@@ -60,7 +60,13 @@ class GPTConfig:
     # them, while ~70% of the mass sits in the 140-20,000 day range. The
     # resolution was in the wrong place, not merely excessive.
     max_dt_days: float = 40000.0 # top bucket edge; measured max Δt is 37,284
-    n_outputs: int = 41          # 40 scored conditions + 5-year death
+    n_outputs: int = 40          # the 40 scored conditions
+    # Was 41, documented as '40 + 5-year death'. It was never true:
+    # train_finetune builds every model with n_outputs=y.shape[1], and the
+    # label array has 40 columns, so the 41st head was never constructed
+    # and death has never been predicted. Adding it is a live idea (it
+    # would make A6's 'predicting record-end' claim testable) but it needs
+    # a 41st label column, which does not exist yet.
     attn_dropout: float = 0.1    # DropKey-style; measured 5x larger gain at small n
     resid_dropout: float = 0.1
     block_size: int = 512

@@ -430,7 +430,12 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
     ar = at_risk_mask(lab).astype(np.float32)
     assert (lab["eid"] == pack.eid).all(), "labels and sequences disagree on order"
 
-    tr = np.flatnonzero(pack.split == "train")
+    # Training rows EXCLUDE the locked test set. `pack.split == "train"` is
+    # 2,791 patients and includes the locked 358.
+    from .cv import trainable_pids
+    _pool = trainable_pids(str(root))
+    tr = np.flatnonzero((pack.split == "train")
+                        & np.isin(pack.pid, list(_pool)))
     va = np.flatnonzero(pack.split == "val")
     assert pack.is_real[va].all(), "validation must never be augmented"
 

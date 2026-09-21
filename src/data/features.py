@@ -213,8 +213,15 @@ def build_features(root: Path | str = ".", cfg: FeatureConfig | None = None,
     # is bit-identical by inspection rather than by argument.
     allowed = (ex.split == "train").to_numpy()
     if fit_mask is None:
-        is_train = allowed
-        train_pids = set(cohort.loc[cohort.split == "train", "pid"])
+        # The default fit universe EXCLUDES the locked test set. `split ==
+        # "train"` is 2,791 patients and includes the locked 358, so the old
+        # default fitted all nine statistics below on 12.8% of the set carved to
+        # be the honest final estimate. `allowed` stays the full train mask
+        # because it is the *permission* check -- what a fit_mask may legally
+        # select -- which is a different question from what the default uses.
+        from ..cv import trainable_pids
+        train_pids = trainable_pids(str(root))
+        is_train = allowed & np.isin(ex.pid.to_numpy(), list(train_pids))
     else:
         is_train = np.asarray(fit_mask, bool)
         assert is_train.shape == allowed.shape, (

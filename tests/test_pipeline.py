@@ -40,7 +40,15 @@ def test_vocabulary_is_fitted_on_training_patients_only(vocab):
     restriction would be doing nothing.
     """
     assert vocab.meta["split"] == "train"
-    assert vocab.meta["n_patients"] == 2791
+    # 2,433 = the 2,791 provided train patients MINUS the 358 locked test set.
+    # This used to assert 2,791, which pinned the bug in place: the vocabulary
+    # decides which codes clear `min_patients_per_code` and where the decile
+    # edges fall, so building it on the locked patients leaks them into every
+    # model that is later scored against them. Asserted against cv as the single
+    # source of truth rather than as another hardcoded number.
+    from src.cv import locked_test_pids, trainable_pids
+    assert vocab.meta["n_patients"] == len(trainable_pids(str(ROOT)))
+    assert vocab.meta["n_patients"] == 2791 - len(locked_test_pids(str(ROOT)))
 
     cohort = load_cohort(ROOT)
     pack = build_sequences(ROOT, vocab, SMALL)

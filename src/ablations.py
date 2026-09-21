@@ -70,8 +70,15 @@ LEDGER = Path("outputs/ablation_ledger.jsonl")
 # pure wobble while still admitting a real gain. Provisional -- it should be
 # re-derived from the sigma_ap that `design --seeds` measures.
 BASE = dict(n_layer=2, n_embd=128, n_head=4, epochs=30, patience=4,
-            min_delta=0.002, dev_frac=0.2, holdout_frac=0.1,
-            eval_on="dev", seed=0)
+            min_delta=0.002, dev_frac=0.0, holdout_frac=0.0, seed=0)
+#
+# dev_frac=0 means: train on the CV pool (2,433 = train minus the locked
+# 358) and select the epoch on the PROVIDED validation set. Carving a
+# further 558-patient dev split out of train cost ~0.0066 AUROC by B1's
+# learning curve -- about one seed sigma, and more than the ensemble-LR
+# gap -- to avoid touching a validation set the organisers supplied for
+# exactly this purpose. It also manufactured D17 and D18, both of which
+# are impossible when the fit set is simply "the pool".
 
 ARMS: dict[str, dict] = {
     # `block_size` is a SeqConfig field, not a TrainConfig one; run_arm pulls it

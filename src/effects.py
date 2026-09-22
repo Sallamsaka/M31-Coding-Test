@@ -48,6 +48,8 @@ sigma something still has to be chosen.
 
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -236,12 +238,28 @@ def orthogonal_effects(df: pd.DataFrame, coded: list[str], metric: str,
     if res.empty:
         return res
 
-    e = res.effect.to_numpy()
-    # Lenth's pseudo standard error.
+    # Lenth's PSE must be pooled over EVERY estimable contrast, not just the
+    # main effects. Its degrees of freedom are m/3, so five main effects give
+    # df = 1 and t(0.975, 1) = 12.71 -- a margin of error so wide the method
+    # cannot reject anything, which is what it did here before this fix. A
+    # 2^(5-1) resolution V design estimates 5 main effects AND 10 two-factor
+    # interactions, so the honest pool is 15, giving df = 5 and t = 2.57.
+    #
+    # Pooling the interactions is also what makes the sparsity assumption
+    # reasonable: it is the interactions that are mostly null, and they are the
+    # reference distribution the main effects are being judged against.
+    pool = list(res.effect.to_numpy())
+    for a, b in itertools.combinations(coded, 2):
+        v = (df[a] * df[b]).to_numpy()
+        hi_i, lo_i = df.loc[v > 0, metric], df.loc[v < 0, metric]
+        if len(hi_i) and len(lo_i):
+            pool.append(float(hi_i.mean() - lo_i.mean()))
+    e = np.asarray(pool)
     s0 = 1.5 * np.median(np.abs(e))
     small = np.abs(e)[np.abs(e) < 2.5 * s0] if s0 > 0 else np.abs(e)
     pse = 1.5 * np.median(small) if len(small) else float("nan")
     res["lenth_pse"] = pse
+    res["lenth_n_contrasts"] = len(e)
     d_lenth = max(1, len(e) // 3)
     res["t_lenth"] = res.effect / pse if pse > 0 else np.nan
     res["p_lenth"] = 2 * stats.t.sf(np.abs(res.t_lenth), df=d_lenth)
@@ -257,7 +275,10 @@ def orthogonal_effects(df: pd.DataFrame, coded: list[str], metric: str,
         res["shrunken"] = shrink(res.effect.to_numpy(),
                                  np.full(len(res), se))
     else:
-        res["shrunken"] = shrink(e, np.full(len(e), pse if pse > 0 else 1.0))
+        # `e` is the 15-contrast Lenth POOL; shrinkage applies to the main
+        # effects only, which is what `res` holds.
+        main = res.effect.to_numpy()
+        res["shrunken"] = shrink(main, np.full(len(main), pse if pse > 0 else 1.0))
 
     return res.reindex(res.effect.abs().sort_values(ascending=False).index
                        ).reset_index(drop=True)

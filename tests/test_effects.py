@@ -172,3 +172,91 @@ def test_orthogonal_effects_ranks_by_magnitude():
     df["y"] = 0.5 + 0.02 * df["c_2"] + 0.005 * df["c_4"]
     res = orthogonal_effects(df, cols, "y")
     assert res.factor.iloc[0] == "c_2" and res.factor.iloc[1] == "c_4"
+
+def test_lenth_pool_counts_each_contrast_exactly_once():
+    """The pool that sets Lenth's df must match the contrasts actually reported.
+
+    The bug this pins: `orthogonal_effects` gained the ten two-factor
+    interactions as REPORTED rows, while the pool that feeds Lenth's PSE went
+    on rebuilding those same ten contrasts itself. Every interaction was
+    therefore counted twice -- 25 pool entries for 15 reported effects, df 8
+    instead of 5, and a PSE median pulled toward the duplicated half.
+
+    It survived because nothing tied the two together: the reporter printed a
+    df it recomputed from `len(res)` while `margin_of_error` had been built
+    from `len(e)`. Two independent derivations of one quantity, silently
+    disagreeing. So the assertion is on the INVARIANT -- one pool entry per
+    reported contrast -- rather than on the literal 15, which would pass again
+    the moment a sixth factor is added.
+    """
+    df, cols = _res_v()
+    df["y"] = 0.5 + 0.02 * df["c_0"]
+    res = orthogonal_effects(df, cols, "y", interactions=True)
+    n_pool = int(res.lenth_n_contrasts.iloc[0])
+    assert n_pool == len(res), (n_pool, len(res))
+    assert int(res.lenth_df.iloc[0]) == max(1, len(res) // 3)
+
+
+def test_lenth_df_printed_matches_df_used():
+    """The margin of error must be t(0.975, df) * PSE for the df reported.
+
+    ⚠ This test does NOT catch the double-count, and the claim that it would
+    was checked and withdrawn. Under the old code `margin_of_error` and the
+    stored df were both derived from the same (inflated) pool length, so they
+    agreed with each other perfectly -- the reconstruction below reproduces the
+    margin either way. The real disagreement was between that stored margin and
+    the REPORTER's independent recomputation of df from `len(res)`, which is
+    now removed by having the reporter read `lenth_df` instead of deriving it.
+
+    So what this pins is narrower than it looks: that the published df, PSE and
+    margin stay mutually consistent, i.e. that no future change alters one of
+    the three without the others. The double-count itself is pinned by
+    `test_lenth_pool_counts_each_contrast_exactly_once`, which was confirmed to
+    go red when the bug is reintroduced. Recorded because a test whose
+    docstring overstates its reach is worse than no test -- it is the pinning
+    failure this project has already hit three times.
+    """
+    from scipy import stats
+
+    df, cols = _res_v()
+    df["y"] = 0.5 + 0.02 * df["c_0"] + 0.01 * df["c_1"] * df["c_2"]
+    res = orthogonal_effects(df, cols, "y", interactions=True)
+    d = int(res.lenth_df.iloc[0])
+    pse = float(res.lenth_pse.iloc[0])
+    assert abs(float(res.margin_of_error.iloc[0])
+               - stats.t.ppf(0.975, d) * pse) < 1e-12
+
+
+def test_interactions_are_reported_and_estimated_unaliased():
+    """A resolution-V design must recover an interaction planted with no main
+    effect at all -- otherwise the fraction is not buying what it claims."""
+    df, cols = _res_v()
+    df["y"] = 0.5 + 0.03 * df["c_1"] * df["c_3"]
+    res = orthogonal_effects(df, cols, "y", interactions=True)
+    assert (res.kind == "interaction").sum() == 10
+    top = res.iloc[0]
+    assert top.factor in ("c_1:c_3", "c_3:c_1"), top.factor
+    assert abs(top.effect - 0.06) < 1e-9          # contrast = 2 * coefficient
+    # and no main effect is contaminated by it
+    mains = res[res.kind == "main"]
+    assert mains.effect.abs().max() < 1e-9, mains
+
+
+def test_bh_is_applied_on_the_fractional_path():
+    """The fractional path reports 15 contrasts at once and had no multiplicity
+    control, while the full-factorial path had BH. Under a pure null, BH must
+    keep the expected number of discoveries near zero."""
+    rng = np.random.default_rng(7)
+    df, cols = _res_v()
+    n_named = 0
+    for _ in range(60):
+        df["y"] = rng.normal(0, 0.01, len(df))
+        centre_sigma = 0.01
+        res = orthogonal_effects(df, cols, "y", sigma_pure=centre_sigma,
+                                 n_pure=4, interactions=True)
+        assert "q_bh" in res.columns and "passes_bh" in res.columns
+        n_named += int(res.passes_bh.sum())
+    # 60 null designs x 15 contrasts = 900 tests. Uncorrected at alpha=0.05
+    # that is ~45 expected discoveries; BH on pure nulls controls FWER, so the
+    # count must be far below it.
+    assert n_named < 20, n_named

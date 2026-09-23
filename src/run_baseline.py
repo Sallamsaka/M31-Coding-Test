@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import joblib
@@ -43,8 +44,8 @@ from .data.labels import at_risk_mask, load_labels
 from .evaluate import (bootstrap_macro, macro_ap, macro_auroc,
                        paired_bootstrap_delta, per_code_table)
 from .predict import write_predictions
-from .train_baseline import (apply_at_risk_mask, fit_gbdt, fit_lr,
-                             fit_prevalence)
+from .train_baseline import (GBDTConfig, LRConfig, apply_at_risk_mask,
+                             fit_gbdt, fit_lr, fit_prevalence)
 from .utils import wandb_shim
 
 __all__ = ["main"]
@@ -67,6 +68,18 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--stride", type=int, default=0,
                     help="cutoff augmentation stride in years; 0 disables it")
     ap.add_argument("--n-boot", type=int, default=500)
+    ap.add_argument("--no-calibrate", action="store_true",
+                    help="ship raw probabilities instead of applying the "
+                         "out-of-fold Platt maps in artifacts/platt_params.npz")
+    ap.add_argument("--with-transformer", action="store_true",
+                    help="also fit the transformer (~45 min) and form the "
+                         "recipes E45 measured as best on out-of-fold data")
+    ap.add_argument("--recipe", default=None,
+                    help="SHIP this key instead of taking the val argmax. "
+                         "The recipe is a selection decision and E45 made it on "
+                         "1,675 out-of-fold rows; re-picking it here by val "
+                         "macro AP would re-select on 365 rows and pay the "
+                         "winner's curse twice for a decision already taken.")
     args = ap.parse_args(argv)
 
     root = Path(args.root)
@@ -89,7 +102,7 @@ def main(argv: list[str] | None = None) -> None:
     from .train_baseline import _fit_rows
     n_fit = int(_fit_rows(F, None).sum())
     print(f"features {F.X.shape}  fit {n_fit:,} "
-          f"(train {int((F.split=='train').sum()):,} minus the locked test set)  "
+          f"(all {int((F.split=='train').sum()):,} train patients; carve retired)  "
           f"val {int(val.sum())}  [{time.time()-t0:.0f}s]", flush=True)
 
     preds: dict[str, np.ndarray] = {}
@@ -125,6 +138,33 @@ def main(argv: list[str] | None = None) -> None:
         preds["ensemble"] = _sigmoid(
             0.5 * (_logit(preds["lr"]) + _logit(preds["gbdt"])))
 
+    # --- transformer ---------------------------------------------------------
+    # Off by default because it costs ~45 min against GBDT's ~18 and the two
+    # baseline models are the documented fallback. On, it changes which recipe
+    # can win: E45 measured, on 1,675 out-of-fold rows, gbdt+transformer 0.2186
+    # and lr+gbdt+transformer 0.2180 against the shipped lr+gbdt 0.2128 -- and
+    # every one of the top three recipes contains the transformer.
+    #
+    # It improves the blend despite being BEHIND gbdt solo (0.1918 vs 0.2075),
+    # because it is the least redundant member: gbdt~transformer agreement is
+    # 0.788 against lr~transformer 0.886. Replacing LR beats adding to it.
+    #
+    # Seed-averaged over three seeds, reusing cross_validate's fitter so the
+    # shipped model is built the same way as the one the OOF numbers measured.
+    # That is consistency with the measurement, not a separate optimisation.
+    if args.with_transformer:
+        t = time.time()
+        from .cross_validate import _fit_transformer
+        preds["transformer"] = apply_at_risk_mask(
+            _fit_transformer(root, _fit_rows(F, None), ex_cfg, y.shape), at_risk)
+        print(f"TX    fit {time.time()-t:.0f}s", flush=True)
+        if "gbdt" in preds:
+            preds["ens_gbdt_tx"] = _sigmoid(
+                0.5 * (_logit(preds["gbdt"]) + _logit(preds["transformer"])))
+            preds["ens_lr_gbdt_tx"] = _sigmoid(
+                (_logit(preds["lr"]) + _logit(preds["gbdt"])
+                 + _logit(preds["transformer"])) / 3.0)
+
     # --- report -------------------------------------------------------------
     print(f"\n{'model':<12} {'macroAUROC':>11} {'macroAP':>9} {'AUROC@at-risk':>14}")
     scores = {}
@@ -137,8 +177,16 @@ def main(argv: list[str] | None = None) -> None:
         run.log({f"{name}/macro_auroc": a, f"{name}/macro_ap": p,
                  f"{name}/auroc_at_risk": ar})
 
-    best = max(scores, key=lambda k: scores[k][1])       # rank by val mAP
-    print(f"\nselected by val macro AP: {best}")
+    if args.recipe:
+        if args.recipe not in preds:
+            raise SystemExit(f"--recipe {args.recipe} not in {list(preds)}")
+        best = args.recipe
+        print(f"\nSHIPPING the pre-specified recipe: {best}")
+        print("  (chosen on 1,675 out-of-fold rows, E45 -- NOT re-selected here."
+              "\n   The val column below is a measurement, not the decision.)")
+    else:
+        best = max(scores, key=lambda k: scores[k][1])   # rank by val mAP
+        print(f"\nselected by val macro AP: {best}")
 
     if not args.smoke:
         ci = bootstrap_macro(y[val], preds[best][val], n_boot=args.n_boot)
@@ -193,6 +241,81 @@ def main(argv: list[str] | None = None) -> None:
                         f"artifacts/model_{name}.joblib", compress=3)
             print(f"saved artifacts/model_{name}.joblib")
 
+    # The transformer has no sklearn estimators to dump -- it is a torch model,
+    # seed-averaged over three runs in logit space. What makes predictions.csv
+    # reproducible is its OUTPUT, so the full-cohort matrix is what gets stored,
+    # alongside the config and seeds that produced it.
+    #
+    # Storing an output rather than an estimator is weaker and is labelled as
+    # such (`kind="precomputed"`). It is still the difference between a
+    # submission that can be rebuilt from disk and one that cannot -- which is
+    # exactly the failure the comment above describes, one model family later.
+    if "transformer" in preds:
+        from .cross_validate import TRANSFORMER_CFG, TRANSFORMER_SEEDS
+        joblib.dump({"kind": "precomputed",
+                     "preds": preds["transformer"].astype("float32"),
+                     "models": [], "preprocess": {},
+                     "feature_names": F.names, "codes": codes,
+                     "config": dict(TRANSFORMER_CFG),
+                     "seeds": list(TRANSFORMER_SEEDS),
+                     "at_risk_rule": "prevalent == 0",
+                     "val_macro_auroc": scores["transformer"][0],
+                     "val_macro_ap": scores["transformer"][1]},
+                    "artifacts/model_transformer.joblib", compress=3)
+        print("saved artifacts/model_transformer.joblib (precomputed matrix)")
+
+    # Every blend this script can emit, named once so the manifest and the JSON
+    # sidecar cannot drift apart from each other or from the code.
+    _RECIPES = {
+        "ensemble":       ("sigmoid(0.5*(logit(lr)+logit(gbdt)))", ["lr", "gbdt"]),
+        "ens_gbdt_tx":    ("sigmoid(0.5*(logit(gbdt)+logit(transformer)))",
+                           ["gbdt", "transformer"]),
+        "ens_lr_gbdt_tx": ("sigmoid((logit(lr)+logit(gbdt)+logit(transformer))/3)",
+                           ["lr", "gbdt", "transformer"]),
+    }
+    recipe_str, components = _RECIPES.get(best, (best, [best]))
+
+    # --- calibration ---------------------------------------------------------
+    # Per-label Platt, fitted OUT OF FOLD (`python -m src.calibrate --fit oof`)
+    # and applied here. Measured held out: BSS 0.1528 -> 0.1755 (+0.0227), with
+    # macro AP and macro AUROC moving by exactly 0.00e+00.
+    #
+    # It cannot lose on the metrics we optimise: a per-label monotone transform
+    # leaves every per-label rank statistic identical, and macro AP/AUROC are
+    # averages of per-label rank statistics. It can only help on proper scoring
+    # rules -- which matters because the grading metric is not known.
+    #
+    # The maps are applied to the FULL cohort matrix together with `at_risk`,
+    # never to an already-masked-and-sliced one: `apply_platt` re-floors
+    # not-at-risk pairs because sigmoid(a*logit(1e-6) + b) is not small for
+    # every fitted (a, b), and `verify_noop` cannot catch that -- the pairs it
+    # would damage are exactly the ones the masked metrics exclude.
+    cal_meta = {"calibrated": False}
+    if not args.no_calibrate:
+        pf = Path("artifacts/platt_params.npz")
+        if not pf.exists():
+            print("  calibration: artifacts/platt_params.npz missing -- "
+                  "run `python -m src.calibrate --fit oof` first; SHIPPING RAW")
+        else:
+            from .calibrate import PlattParams, apply_platt, verify_noop
+            d = np.load(pf)
+            pp = PlattParams(a=d["a"], b=d["b"], ok=d["ok"])
+            raw = preds[best]
+            cal = apply_platt(raw, pp, at_risk=at_risk)
+            # Gate on the guarantee rather than trusting it: if the ranking
+            # moved, the transform is not monotone and we ship the raw scores.
+            chk = verify_noop(raw[val], cal[val], y[val], at_risk[val])
+            if max(abs(chk["d_ap"]), abs(chk["d_auroc"])) > 1e-9:
+                print(f"  calibration REFUSED: macro AP moved {chk['d_ap']:.2e},"
+                      f" AUROC {chk['d_auroc']:.2e} -- shipping raw")
+            else:
+                preds[best] = cal
+                cal_meta = {"calibrated": True,
+                            "calibration": "per-label Platt, fitted on OOF",
+                            "n_labels_calibrated": int(pp.ok.sum())}
+                print(f"  calibration applied: {int(pp.ok.sum())}/40 labels, "
+                      f"macro AP moved {chk['d_ap']:.2e} (no-op verified)")
+
     # --- submission ----------------------------------------------------------
     # Real examples occupy the first len(cohort) rows with eid == pid, so the
     # real block is already in the cohort order `write_predictions` expects.
@@ -200,21 +323,31 @@ def main(argv: list[str] | None = None) -> None:
     # ensemble is a rule over models rather than a model, and a rule that lives
     # only in the code that produced one CSV is not a reproducible artifact.
     joblib.dump({"selected": best,
-                 "recipe": ("sigmoid(0.5*(logit(lr)+logit(gbdt)))"
-                            if best == "ensemble" else best),
-                 "components": ["lr", "gbdt"] if best == "ensemble" else [best],
+                 "recipe": recipe_str,
+                 "components": components,
                  "feature_names": F.names, "codes": codes,
                  "at_risk_rule": "prevalent == 0",
                  "val_macro_auroc": scores[best][0],
-                 "val_macro_ap": scores[best][1]},
+                 "val_macro_ap": scores[best][1],
+                 **cal_meta},
                 "artifacts/submission_manifest.joblib", compress=3)
     print("saved artifacts/submission_manifest.joblib "
           f"(selected={best})")
 
+    # The JSON sidecar records the RECIPE, not just the word "ensemble". It
+    # previously carried only {"model": "ensemble"} plus val scores, so the sole
+    # on-disk record of what was actually combined -- and of whether the output
+    # was calibrated -- was a binary joblib nobody reads. A submission whose
+    # own metadata cannot tell you what produced it is not reproducible.
     sub = write_predictions(preds[best][:n_real], model_name=best, root=root,
                             extra_meta={"val_macro_auroc": scores[best][0],
                                         "val_macro_ap": scores[best][1],
-                                        "stride": args.stride})
+                                        "stride": args.stride,
+                                        "recipe": recipe_str,
+                                        "components": components,
+                                        "lr_config": asdict(LRConfig()),
+                                        "gbdt_config": asdict(GBDTConfig()),
+                                        **cal_meta})
     print(f"wrote outputs/predictions.csv  {sub.shape}")
     run.summary(selected=best, val_macro_ap=scores[best][1])
     run.finish()

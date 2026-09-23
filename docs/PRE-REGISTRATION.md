@@ -154,7 +154,25 @@ truncation policy; the de-duplicated ~35-label macro.
 
 ---
 
-## 7. The locked test set — one question, one read
+## 7. Our carved test set — AMENDED: measure freely, never select
+
+> ⚠ **AMENDED.** The "one question, one read" rule below was wrong and is
+> withdrawn. The winner's curse comes from **selecting** on a set, not from
+> measuring on it: scoring M models leaves every score unbiased, and only
+> taking the `argmax` over them costs `sigma*sqrt(2 ln M)`. The rule that replaces it:
+> **select on CV folds, measure and report here as often as we like.**
+>
+> The cost of the old rule was total. Verified: this set carried **zero** numbers
+> while every result in the project — the 20-run design, 7 ablations, 5 basin
+> runs, 33 Phase B arms — sat on the provided validation set, whose
+> winner's-curse bound (+0.027) exceeds every difference being measured. See D30.
+>
+> **What survives unchanged from below:** the power argument. At 358 patients with
+> 3 positives on the rarest label, it **cannot rank** LR against GBDT against the
+> transformer (§E6: separating 0.750 from 0.800 at 80% power needs 565+565).
+> Report every model here with an interval; choose between them elsewhere.
+
+### Original text, retained so the change is legible
 
 **Question, fixed now:** *does the shipped model's macro AP exceed the
 at-risk-mask-only baseline, with an interval?*
@@ -189,6 +207,44 @@ The point of this section is that it is checkable. Each is a commitment.
 | 5 | **The transformer will not beat LR** on the CV instrument. If it does, the first action is a bug hunt, not a paragraph. | moderate |
 | 6 | **The time ablation will not resolve** at one run per arm: its MDE is 0.0333 against a project-wide spread of 0.0148. The `multiset` contrast is the only one plausibly large enough. | high |
 | 7 | **Curvature will be detectable in lr** — a two-level contrast straddling a basin reads near zero, which is why centre points are in the design. | low–moderate |
+| 8 | **The design's predicted-best cell will UNDERPERFORM its prediction.** Recorded before the runs, alongside the numeric prediction in `outputs/design_ledger.jsonl` (`confirm_prereg`). Reasons below. | moderate |
+
+### 8.1 Prediction 8, stated in full before the runs
+
+`propose_config` ranks all 32 cells of the full factorial from the 16 that were
+run, and its top cell on **both** metrics is one of the 16 that were **not**.
+Its predictions: **macro AP 0.2500, macro AUROC 0.7816**, against a best
+observed corner of 0.2432 / 0.7638.
+
+Three reasons to expect it to fall short, all structural rather than
+pessimistic:
+
+1. **The model is saturated.** 16 runs, 16 parameters, zero residual degrees of
+   freedom. It reproduces every observed corner exactly, so nothing inside the
+   experiment can contradict it.
+2. **The extrapolation rests entirely on effect heredity.** Under the generator
+   I = ABCDE every two-factor interaction is aliased with a three-factor one,
+   and predictions for the complementary fraction assume all three-way and
+   higher terms are zero. That assumption is untestable from inside the design
+   -- which is the whole reason for running this.
+3. **A predicted maximum over 32 cells is itself a selected quantity.** Even
+   with shrinkage, the argmax of a fitted surface is biased upward.
+
+**The comparison SE is sqrt(sigma^2/R + sigma^2), not s/sqrt(R).** For a
+saturated two-level design Var(prediction) = sigma^2 at every cell, so the
+prediction is exactly as noisy as one run and the target is not a fixed number.
+At R = 3 seeds that is 1.15*sigma, roughly double the naive 0.58*sigma. Fixed in
+advance so a miss cannot be declared on an SE chosen after seeing the result.
+
+**Falsification threshold:** a prediction error beyond 2 SE on the primary
+(macro AP) counts as prediction 8 confirmed and, more importantly, as evidence
+that `propose_config`'s config recommendation should not be acted on -- the
+design's trustworthy output would then be its effects alone.
+
+**A weaker question is also recorded, because it survives either outcome:**
+whether the proposed cell beats the **mean of the 16 corners actually run**.
+That comparison does not depend on the point prediction being right, only on the
+ranking being useful.
 
 **If prediction 5 fails in the transformer's favour, the bug hunt comes first.**
 Two of this project's most convincing findings were bugs, and the largest

@@ -301,6 +301,141 @@ def test_feature_fusion_actually_reaches_the_output(mode):
     assert delta > 1e-4, f"{mode} fusion is a no-op: delta {delta:.2e}"
 
 
+@pytest.mark.parametrize("mode", ["readout", "token"])
+def test_modality_dropout_at_one_is_identical_to_having_no_features(mode):
+    """p = 1.0 in TRAINING must reproduce the features-zeroed forward exactly.
+
+    Behavioural, not a flag check: it does not assert that `modality_dropout`
+    is set, it asserts that setting it produces the output the model gives when
+    the tabular branch is genuinely absent. That is the property the arm is
+    supposed to train against, and it is the same condition the collapse check
+    evaluates at.
+
+    The non-vacuity guard matters more than the equality here. If features did
+    not reach the output at all -- which is exactly what `token` fusion did
+    before D5, at a measured delta of 0.0000 -- then zeroing them would trivially
+    change nothing and this test would pass while testing nothing.
+    """
+    torch.manual_seed(0)
+    n_feat = 128
+    # attn/resid dropout MUST be silenced to isolate the variable. They
+    # default to 0.1 and are active in train mode, so two identical forwards
+    # differ by ~0.24 and every assertion below would be measuring them instead
+    # of modality dropout. Config (1) runs at 0.0 anyway, so this is also the
+    # realistic setting rather than a convenience.
+    m = PatientTransformer(GPTConfig(vocab_size=VOCAB, n_outputs=40,
+                                     fusion=mode, n_features=n_feat,
+                                     attn_dropout=0.0, resid_dropout=0.0,
+                                     modality_dropout=1.0))
+    tok = torch.randint(1, VOCAB, (4, 12))
+    dt = torch.arange(12, 0, -1).float().repeat(4, 1)
+    lengths = torch.full((4,), 12)
+    f = torch.randn(4, n_feat)
+
+    m.train()
+    with torch.no_grad():
+        dropped = m(tok, dt, lengths, features=f)
+        zeroed = m(tok, dt, lengths, features=torch.zeros_like(f))
+    assert torch.allclose(dropped, zeroed, atol=1e-6), (
+        "modality_dropout=1.0 did not reproduce the features-zeroed forward")
+
+    # Non-vacuity: the features must genuinely matter, or the above is empty.
+    m.eval()
+    with torch.no_grad():
+        delta = (m(tok, dt, lengths, features=f)
+                 - m(tok, dt, lengths, features=torch.zeros_like(f))
+                 ).abs().max().item()
+    assert delta > 1e-4, f"vacuous: features do not reach the output ({delta:.2e})"
+
+
+def test_modality_dropout_is_training_only():
+    """In eval the branch must be intact however high p is set.
+
+    Otherwise every reported metric would be computed on a randomly crippled
+    model, and the damage would look like noise rather than like a bug.
+    """
+    torch.manual_seed(0)
+    n_feat = 64
+    m = PatientTransformer(GPTConfig(vocab_size=VOCAB, n_outputs=40,
+                                     fusion="readout", n_features=n_feat,
+                                     attn_dropout=0.0, resid_dropout=0.0,
+                                     modality_dropout=1.0)).eval()
+    ref = PatientTransformer(GPTConfig(vocab_size=VOCAB, n_outputs=40,
+                                       fusion="readout", n_features=n_feat,
+                                       attn_dropout=0.0, resid_dropout=0.0,
+                                       modality_dropout=0.0)).eval()
+    ref.load_state_dict(m.state_dict())
+    tok = torch.randint(1, VOCAB, (3, 9))
+    dt = torch.arange(9, 0, -1).float().repeat(3, 1)
+    lengths = torch.full((3,), 9)
+    f = torch.randn(3, n_feat)
+    with torch.no_grad():
+        assert torch.allclose(m(tok, dt, lengths, features=f),
+                              ref(tok, dt, lengths, features=f), atol=1e-6), (
+            "modality_dropout leaked into evaluation")
+
+
+def test_modality_dropout_default_is_inert():
+    """The default must reproduce the pre-existing model bit-for-bit.
+
+    Every number measured before this switch existed was produced at p = 0, so
+    if the default were not inert the new arm would silently re-baseline the
+    whole project -- the failure mode G4 warns about.
+    """
+    torch.manual_seed(0)
+    n_feat = 64
+    # attn/resid dropout MUST be silenced to isolate the variable. They
+    # default to 0.1 and are active in train mode, so two identical forwards
+    # differ by ~0.24 and every assertion below would be measuring them instead
+    # of modality dropout. Config (1) runs at 0.0 anyway, so this is also the
+    # realistic setting rather than a convenience.
+    cfg = dict(vocab_size=VOCAB, n_outputs=40, fusion="readout",
+               n_features=n_feat, attn_dropout=0.0, resid_dropout=0.0)
+    m = PatientTransformer(GPTConfig(**cfg))
+    assert m.cfg.modality_dropout == 0.0
+    tok = torch.randint(1, VOCAB, (3, 9))
+    dt = torch.arange(9, 0, -1).float().repeat(3, 1)
+    lengths = torch.full((3,), 9)
+    f = torch.randn(3, n_feat)
+    m.train()
+    with torch.no_grad():
+        a = m(tok, dt, lengths, features=f)
+        b = m(tok, dt, lengths, features=f)
+    assert torch.equal(a, b), "p=0 is not deterministic in training mode"
+
+
+def test_modality_dropout_is_per_example_not_per_unit():
+    """At an intermediate p some rows must be dropped and others kept.
+
+    This is the distinction from `resid_dropout`, which thins units inside the
+    projection and leaves every example's tabular branch informative. If the
+    mask were per-unit the arm would not be testing what it claims to test.
+    """
+    torch.manual_seed(0)
+    n_feat = 32
+    # attn/resid dropout MUST be silenced to isolate the variable. They
+    # default to 0.1 and are active in train mode, so two identical forwards
+    # differ by ~0.24 and every assertion below would be measuring them instead
+    # of modality dropout. Config (1) runs at 0.0 anyway, so this is also the
+    # realistic setting rather than a convenience.
+    m = PatientTransformer(GPTConfig(vocab_size=VOCAB, n_outputs=40,
+                                     fusion="readout", n_features=n_feat,
+                                     attn_dropout=0.0, resid_dropout=0.0,
+                                     modality_dropout=0.5))
+    m.train()
+    tok = torch.randint(1, VOCAB, (64, 6))
+    dt = torch.arange(6, 0, -1).float().repeat(64, 1)
+    lengths = torch.full((64,), 6)
+    f = torch.randn(64, n_feat)
+    with torch.no_grad():
+        out = m(tok, dt, lengths, features=f)
+        zero = m(tok, dt, lengths, features=torch.zeros_like(f))
+    # Rows whose features were dropped match the all-zero forward exactly.
+    matched = torch.isclose(out, zero, atol=1e-6).all(dim=1)
+    assert 0 < int(matched.sum()) < 64, (
+        f"expected a mix of dropped and kept rows, got {int(matched.sum())}/64")
+
+
 def test_fused_feature_token_is_visible_to_the_whole_sequence():
     """Under `token` fusion the summary must reach other positions, not just
     sit there. That is the whole difference from late fusion."""

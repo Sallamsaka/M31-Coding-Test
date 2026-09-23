@@ -79,7 +79,15 @@ def test_saved_model_reproduces_predictions_csv():
             f"the submission needs component {comp!r} but {bp.name} was never "
             "saved -- the shipped predictions cannot be reproduced")
         b = joblib.load(bp)
-        parts.append(_score(b, b.get("preprocess") or {}))
+        if b.get("kind") == "precomputed":
+            # The transformer is a torch model, seed-averaged over three runs;
+            # there is no sklearn estimator to re-score. Its saved artifact is
+            # the full-cohort output matrix. Weaker than an estimator and
+            # labelled as such -- but it is what makes the submission
+            # rebuildable, which is what this test is actually about.
+            parts.append(np.asarray(b["preds"], dtype=np.float64))
+        else:
+            parts.append(_score(b, b.get("preprocess") or {}))
 
     if len(parts) == 1:
         P = parts[0]
@@ -89,6 +97,20 @@ def test_saved_model_reproduces_predictions_csv():
 
     lab = load_labels(ROOT)
     ar = at_risk_mask(lab)
+
+    # Calibration is part of the shipped pipeline, so it is part of what has to
+    # be reproduced. Without this the reconstruction rebuilds the RAW blend and
+    # disagrees with a calibrated predictions.csv -- which would look like a
+    # broken artifact rather than a missing step.
+    if manifest.get("calibrated"):
+        from src.calibrate import PlattParams, apply_platt
+        pf = ROOT / "artifacts" / "platt_params.npz"
+        assert pf.exists(), (
+            "the submission is marked calibrated but artifacts/platt_params.npz "
+            "is missing -- the shipped predictions cannot be reproduced")
+        d = np.load(pf)
+        P = apply_platt(P, PlattParams(a=d["a"], b=d["b"], ok=d["ok"]), at_risk=ar)
+
     P = np.where(ar, P, 1e-6)
     P = np.clip(P, 1e-6, 1 - 1e-6)
 

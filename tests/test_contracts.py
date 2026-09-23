@@ -142,3 +142,73 @@ def test_augmentation_off_reproduces_the_original_cohort():
     assert plain.is_real.all()
     assert (plain.pid.to_numpy() == cohort.pid.to_numpy()).all()
     assert (plain.cutoff.to_numpy() == cohort.anchor.to_numpy()).all()
+
+# ---------------------------------------------- stratified fold assignment ---
+def test_stratified_folds_beat_random_on_the_rarest_label():
+    """The whole point of stratifying: raise the FLOOR on per-label positives.
+
+    Random patient-grouped folds already match the provided test set on every
+    distributional axis measured (events KS p = 0.37-0.96, history length, age,
+    sex, per-label prevalence), so there is nothing to correct there. What they
+    do not control is the rare tail -- a fold can land 1 positive for a label,
+    and a per-label AP on one positive is a coin flip that macro AP then
+    averages in with equal weight.
+
+    Asserted as an INEQUALITY against random on the same labels, not against a
+    hard-coded number, so the test keeps meaning if the cohort changes.
+    """
+    import numpy as np
+
+    from src.cv import stratified_fold_of
+
+    rng = np.random.default_rng(0)
+    n, L, K = 2000, 20, 5
+    # Prevalences spanning the real range: one very rare label plus common ones.
+    prev = np.concatenate([[0.012], rng.uniform(0.03, 0.25, L - 1)])
+    Y = (rng.random((n, L)) < prev).astype(int)
+
+    strat = stratified_fold_of(Y, K, seed=0)
+    rand = rng.permutation(n) * K // n
+
+    worst_s = min(Y[strat == k].sum(0).min() for k in range(K))
+    worst_r = min(Y[rand == k].sum(0).min() for k in range(K))
+    assert worst_s >= worst_r, (worst_s, worst_r)
+
+    # and it must not achieve that by unbalancing the folds
+    sizes = np.array([(strat == k).sum() for k in range(K)])
+    assert sizes.max() - sizes.min() <= 1, sizes
+
+
+def test_stratified_folds_assign_every_patient_exactly_once():
+    """A patient in no fold is silently dropped from evaluation; a patient in
+    two is scored twice, which breaks `bootstrap_macro`'s promise to resample
+    patients rather than rows."""
+    import numpy as np
+
+    from src.cv import stratified_fold_of
+
+    rng = np.random.default_rng(1)
+    Y = (rng.random((500, 12)) < 0.1).astype(int)
+    a = stratified_fold_of(Y, 4, seed=1)
+    assert a.shape == (500,)
+    assert a.min() >= 0 and a.max() <= 3
+    assert np.bincount(a, minlength=4).sum() == 500
+
+
+def test_stratified_folds_handle_a_label_with_no_positives():
+    """An all-zero label must not crash the assignment or starve a fold.
+
+    It cannot be balanced -- there is nothing to spread -- so the requirement is
+    only that it is survived, and that the other labels are still stratified.
+    """
+    import numpy as np
+
+    from src.cv import stratified_fold_of
+
+    rng = np.random.default_rng(2)
+    Y = (rng.random((300, 6)) < 0.15).astype(int)
+    Y[:, 3] = 0
+    a = stratified_fold_of(Y, 3, seed=2)
+    assert set(np.unique(a)) == {0, 1, 2}
+    sizes = np.array([(a == k).sum() for k in range(3)])
+    assert sizes.max() - sizes.min() <= 1, sizes

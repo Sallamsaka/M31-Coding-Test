@@ -16,12 +16,12 @@ before it. 3,514 patients, split 2,791 train / 365 validation / 358 test.
 
 | | |
 |---|---|
-| **Best validation macro AUROC** | 0.7727 (LR + transformer ensemble) |
-| **Best validation macro AP** | 0.2368 (logistic regression), 95% CI [0.2306, 0.2820] |
+| **Best validation macro AUROC** | **0.7700** (LR + GBDT + transformer, the shipped blend) |
+| **Best validation macro AP** | **0.2681** (the shipped blend); LR alone 0.2368, 95% CI [0.2306, 0.2820] |
 | **Prevalence-only control** | exactly 0.5000 — the metric code is correct |
 | **Resolution limit of this validation set** | ±0.01 macro AUROC |
-| **Model shipped** | logistic regression — by the pre-registered rule, not by the point estimate |
-| **Automated checks** | 63, covering leakage, labels, submission contract, model invariants |
+| **Model shipped** | `sigmoid((logit(LR)+logit(GBDT)+logit(transformer))/3)`, per-label Platt calibrated — chosen on **1,675 out-of-fold rows**, not on validation |
+| **Automated checks** | 130+, covering leakage, labels, submission contract, model invariants, cache-key provenance and calibration no-op |
 
 Four findings I would put ahead of the score — including one about whether
 the score can distinguish anything at all:
@@ -31,13 +31,39 @@ the score can distinguish anything at all:
    A large part of the achievable signal is "is this record about to end."
 2. **Cutoff augmentation — the idea I expected to matter most — makes things
    worse**, and I can say exactly why rather than just that it did.
-3. **No two models here are distinguishable.** The winner's-curse bound on
-   the number of times the validation set was consulted is **+0.038 to
-   +0.051** macro AUROC, which exceeds every gap measured between logistic
-   regression, gradient boosting, their ensemble and the transformer. On 365
-   patients with a median of 11 positives per label, "which model is best"
-   is not an answerable question — and answering it anyway is the most
-   common way a result like this goes wrong.
+3. **The validation set could not distinguish these models, so I stopped
+   asking it.** On 365 patients with a median of 11 positives per label, the
+   winner's-curse bound over 26 consultations is **+0.0265** macro AUROC —
+   larger than every gap measured on validation between logistic regression,
+   gradient boosting, their ensemble and the transformer. "Which model is
+   best" is not an answerable question on that set, and answering it anyway
+   is the most common way a result like this goes wrong.
+
+   The fix is not a better test, it is a better **instrument**: grouped
+   cross-validation over the full 2,791-patient pool, every patient scored
+   exactly once out of fold, **1,675 rows** instead of 365. On it the
+   question becomes answerable, and the answers are not the ones validation
+   implied:
+
+   | comparison | Δ macro AP | 95% CI | verdict |
+   |---|---|---|---|
+   | GBDT − LR | **+0.0211** | [+0.0076, +0.0319] | resolvable |
+   | transformer − LR | −0.0018 | [−0.0173, +0.0138] | tied |
+   | (LR+GBDT+transformer) − (LR+GBDT) | **+0.0057** | [+0.0018, +0.0099] | resolvable |
+
+   Two things follow that validation actively got wrong. GBDT beats LR on
+   **5 of 5 folds** — on validation LR led on AUROC, which is how the
+   shipped model came to be a linear one. And the transformer earns a place
+   in the ensemble *despite being behind GBDT on its own* (0.1918 vs
+   0.2075), because it is the least redundant member: its rank agreement
+   with GBDT is **0.788** against LR's **0.886**. Replacing LR beats adding
+   to it.
+
+   > **The bound itself was wrong twice.** It was first quoted as +0.038 to
+   > +0.051, computed from a **hardcoded σ of 0.02 that was never measured**.
+   > The measured value is **0.0104**, so the published figure was inflated
+   > about 2×. I found this while trying to justify the number rather than
+   > re-use it.
 4. **Two bugs in my own experiment produced a convincing false result** before
    either was caught — and four more were found the same way, including one
    that would have shipped a model nobody could apply and one that would have
@@ -238,15 +264,26 @@ All rows use the same 3,320-column feature matrix and the same at-risk mask.
 |---|---|---|---|
 | prevalence only, unmasked | **0.5000** | 0.0469 | — |
 | at-risk mask only, no model | 0.5498 | 0.0572 | — |
-| **logistic regression** | 0.7666 | **0.2368** | 9 s |
-| gradient boosting | 0.7645 | 0.2554 † | 23 min |
-| transformer, causal (P4) | 0.7557 | 0.1860 | 2.1 h |
-| transformer, bidirectional (P3) | 0.7409 | 0.1832 | 1.9 h |
-| **ensemble** (LR + P4, logit average) | **0.7727** | 0.2356 | — |
+| **logistic regression** | 0.7666 | 0.2368 | 9 s |
+| gradient boosting | 0.7562 | 0.2541 | 19 min |
+| transformer, **tuned** (1L/d64, lr 1.2e-3, fusion_dim 128, 3 seeds) | 0.7650 | 0.2486 | 15 min |
+| ensemble, LR + GBDT | 0.7654 | 0.2649 | — |
+| ensemble, GBDT + transformer | 0.7665 | **0.2721** | — |
+| **ensemble, LR + GBDT + transformer — SHIPPED** | **0.7700** | 0.2681 | — |
+| *(superseded)* transformer, causal P4, untuned | 0.7557 | 0.1860 | 2.1 h |
+| *(superseded)* transformer, bidirectional P3, untuned | 0.7409 | 0.1832 | 1.9 h |
+| *(superseded)* ensemble, LR + untuned P4 | 0.7727 | 0.2356 | — |
 
-† the gradient-boosting row is from the earlier 2,821-column matrix; its
-3,320-column rerun was cut to free CPU for the transformer. Every other row
-uses the same 3,320 columns.
+The superseded rows are kept rather than deleted, because the distance between
+them and the rows above is the result of the tuning programme and deleting it
+would hide the work. **The untuned transformer scores 0.1860 macro AP; the tuned
+one scores 0.2486** — a +0.0626 gap, larger than any difference between model
+*families* anywhere in this report. Reading the old rows as "what a transformer
+does on this task" was the mistake an earlier draft made.
+
+All rows now use the same 3,320-column matrix. The shipped row is additionally
+per-label Platt calibrated, which does not move macro AUROC or macro AP (by
+construction, and verified to 0.00e+00 — see §4).
 
 P4 is the 2M-parameter decoder the assignment recommends: one position per
 event, continuous time in place of positional indices, a Δt attention bias,
@@ -272,13 +309,28 @@ is 0.051 and is not explainable that way.
 Spearman correlation between per-label scores is **0.436** for LR-versus-P4,
 against **0.740** for LR-versus-GBDT. A second feature model agrees with the
 first; the sequence model disagrees with it about which patients are at risk.
-That decorrelation is the mechanism behind the ensemble posting the highest
-AUROC in the table (0.7727) while its own component scores 0.111 below LR.
+That decorrelation is the mechanism behind the ensemble topping the table while
+its own component scores below LR.
 
 So the defensible claim is not "the transformer is competitive" and not "the
 transformer lost". It is: **at this scale the transformer buys diversity
-rather than accuracy** — and on 365 patients even that gain cannot be
-separated from noise.
+rather than accuracy.**
+
+That was written when it could not be separated from noise on 365 patients. It
+now can be. On **1,675 out-of-fold rows** the same mechanism is measured rather
+than inferred, and it survives:
+
+- agreement with GBDT **0.788**, against LR-versus-transformer **0.886** — the
+  transformer is the *least redundant* member of the three, and LR is the one it
+  most duplicates;
+- adding it to LR+GBDT is worth **+0.0057 [+0.0018, +0.0099]** macro AP,
+  **resolvable**;
+- and it earns that while scoring **below GBDT on its own** (0.1918 vs 0.2075).
+
+Which is why the shipped model is a three-way blend and why *replacing* LR with
+the transformer scores as well as adding it (0.2186 vs 0.2180, a difference this
+instrument cannot resolve). The diversity claim was right; it just needed an
+instrument that could see it.
 
 **The two masks differ in shape, not in endpoint.** P3 (bidirectional) learns
 faster — it leads P4 on AP by 0.042 at epoch 6 — then peaks at epoch 11 and
@@ -300,12 +352,57 @@ This is what the literature predicts at this scale, and it is the second
 independent sign — after the learning curve — that the binding constraint
 here is data rather than architecture.
 
-The two pretrained arms (P1, causal + next-token; P2, bidirectional +
-masked-token) are implemented and verified end-to-end on a smoke run, but
-were not trained — roughly eight more CPU-hours than the budget allowed. The
-code refuses to run them as anything other than themselves: an explicit guard
-raises rather than silently executing a configuration identical to P4/P3 and
-reporting it as a pretraining ablation.
+### Why the two pretraining arms were built and deliberately not run
+
+P1 (causal + next-token) and P2 (bidirectional + masked-token) are implemented
+and verified end-to-end on a smoke run. They were not trained, and that is a
+decision rather than a budget accident — the cost is ~8 CPU-hours, which is
+affordable against a 19-minute GBDT fold if the expected value justified it.
+Three independent lines say it does not:
+
+**The corpus is an order of magnitude too small.** There is no external EHR
+corpus here, so "pretraining" means self-pretraining on the same 2,791
+patients — roughly **0.8M tokens**, against BabyLM's smallest track at **10M
+words**. Nothing in the pretraining literature shows gains below that floor.
+
+**The result that motivated it is a transfer result, not a pretraining result.**
+The first draft made the transformer the centrepiece on Med-BERT's small-cohort
+curve. That curve is bought with **28.5M pretraining patients** and then
+transferred; below n=500 Med-BERT itself loses to logistic regression. We have
+nothing to transfer *from*, which is the part of the setup that produced the
+curve.
+
+**The nearest published head-to-head goes the other way.** On EHRSHOT's
+"Assignment of New Diagnoses" — this exact task family, at 793–1,392 training
+patients — a **141M-parameter model pretrained on 2.57M patients scores 0.707
+against counts+LightGBM at 0.719**. Pretraining at a scale we cannot reach did
+not win this task family.
+
+And the protocol itself has a measured null on a comparable corpus: **+0.006
+AUC, p = 0.63**.
+
+The deeper reason is that pretraining does not address the binding constraint.
+The learning curve (§4) is **still rising at full data**, so this model is
+limited by *patients*. Self-pretraining re-reads the patients we already have;
+it adds none. That is the same reason cutoff augmentation failed — it adds
+rows, not patients — and it is measured, not assumed.
+
+What was done instead: the arms exist and run end-to-end, and the objectives are
+verified by test rather than by inspection — `lm_forward` is shown to be causal
+even on a bidirectional model, the next-token objective is shown not to see the
+token it predicts, and the masked objective is shown to score only the masked
+positions and to start at a loss of 6.74 against `ln(1105) = 7.01`, i.e. not
+leaking its target.
+
+**What is *not* guarded, stated plainly because an earlier draft of this report
+claimed otherwise:** nothing at runtime stops a mislabelled run. `--arm P1` with
+`pretrain_epochs=0` executes the pretraining loop zero times and produces a run
+labelled P1 that is numerically P4, and nothing raises. The arm table is checked
+against `configs/default.yaml` by a test, and the objectives are checked by
+tests, but the *run* is not. That is a gap, not a feature.
+
+Running them remains worthwhile for exactly one reason: a pre-registered null is
+a result, and this one is pre-registered at ~65% confidence it will not resolve.
 
 Two caveats on that table, both of which matter more than the ordering.
 
@@ -318,8 +415,15 @@ be read to four decimal places.
 **All of these models sit inside each other's confidence intervals.** The LR
 bootstrap interval alone spans [0.7462, 0.7847], which contains every other
 row. The honest summary is not "LR wins" but "LR, GBDT and their ensemble are
-indistinguishable on 365 patients, and the ensemble is the only pairwise
+indistinguishable **on 365 patients**, and the ensemble is the only pairwise
 difference the paired bootstrap can resolve at all."
+
+That scope qualifier is load-bearing, and it is why the table below is not the
+last word. On 1,675 out-of-fold rows the same comparison **does** resolve, and
+it reverses this one: GBDT beats LR by **+0.0211 [+0.0076, +0.0319]** macro AP
+on 5 of 5 folds. The model shipped is a three-way blend chosen there, not here
+(§0). Reading a ranking off this table would have shipped the linear model --
+which is exactly what an earlier draft of this report did.
 
 The first row is not a model. It predicts the training base rate for
 everyone, so its macro AUROC must be exactly 0.5 — it is a test of the metric
@@ -433,7 +537,7 @@ rather than estimated. As of the final run:
 | counting | M | bound |
 |---|---|---|
 | distinct model families | 6 | **+0.038** macro AUROC |
-| every individual look at validation | 26 | **+0.051** macro AUROC |
+| every individual look at validation | 26 | **+0.0265** macro AUROC (measured sigma 0.0104; the earlier +0.051 used an unmeasured 0.02) |
 
 The second row is the one that is easy to omit and should not be. Keeping the
 best epoch by validation AP is early stopping, and early stopping *is*
@@ -636,13 +740,43 @@ module artefacts. Macro-averaging therefore double-counts: there are roughly
 **35 effective prediction problems, not 40**, and the macro metrics are
 correspondingly less independent than their name suggests.
 
-### Calibration is mostly not assessable, and saying so is the honest answer
+### Calibration curves are not estimable — but calibration itself is, and it ships
 
-Reliable calibration assessment needs on the order of 200 events. Our most
-common label has 97 validation positives and the rarest has 5. Flexible
-calibration curves are therefore **not estimable for 39 of 40 labels**, and
-plotting them would be plotting noise. Calibration-in-the-large is reported;
-curves are not.
+Reliable calibration-*curve* assessment needs on the order of 200 events. Our
+most common label has 97 validation positives and the rarest has 5. Flexible
+curves are therefore **not estimable for 39 of 40 labels**, and plotting them
+would be plotting noise. That remains true and no curves are shown.
+
+It does not follow that nothing can be done, and an earlier draft of this report
+stopped one step short of the useful conclusion. Two facts change the picture:
+
+**The shipped model has a specific reason to be miscalibrated.** It is a
+logit-average of three members, and logit-averaging is *not*
+calibration-preserving — it distorts confidence relative to its parents. Measured:
+the blend predicts at **0.67×** the observed event rate.
+
+**Per-label Platt scaling is monotone in the score**, so macro AUROC and macro AP —
+both averages of per-label rank statistics — are *provably* unchanged by it. The
+fitted maps are two parameters per label, not a flexible curve, so the 200-event
+requirement does not apply.
+
+Fitted on the **out-of-fold** matrix (1,675 rows) and scored on validation — disjoint
+sets, so the numbers are held out, not in-sample:
+
+| | Brier | BSS | REL | REL/RES |
+|---|---|---|---|---|
+| uncalibrated | 0.04147 | 0.1528 | 0.00083 | 0.107 |
+| per-label Platt | **0.04036** | **0.1755** | **0.00045** | **0.054** |
+
+**+0.0227 Brier skill, reliability halved, and macro AP moved by exactly
+0.00e+00** — not "below tolerance", exactly zero. The shipped file's predicted
+rate moves from 0.67× observed to **0.83×**.
+
+This is the only change available that *cannot lose* on the metrics being
+optimised while improving every proper scoring rule — which matters because the
+grading metric is not stated anywhere in the brief. It is applied with a gate:
+`run_baseline` re-verifies the no-op at ship time and refuses the calibration,
+shipping raw scores, if any rank metric moves by more than 1e-9.
 
 ### Synthea is not real EHR data
 
@@ -671,11 +805,27 @@ a wide margin and it is not a modelling change.
 no transformer-versus-baseline difference can be called real — this is the
 largest concrete gap in the current results, and it is four hours of CPU.
 
-**3. The two pretraining arms.** Implemented, tested and unrun. The
-literature predicts null (+0.006 AUC, p=0.63 for this exact protocol on a
-comparable corpus), and our pretraining corpus is ~0.8M tokens against
-BabyLM's 10M-word smallest track. Worth running precisely because a
-pre-registered null is a result.
+**3. ~~The two pretraining arms.~~ DONE for P1 — a measured null.** Run at the
+shipped config (not the 4L/d192 CLI default, which is the architecture this
+report abandons), three seeds, paired against the identical config without the
+warm-up: **macro AP −0.0015 [−0.0339, +0.0309], macro AUROC +0.0009 [−0.0086,
++0.0103]**. Neither resolves and the signs are mixed.
+
+The warm-up itself trained — next-token loss fell from 6.20 to 2.9 against
+`ln(1105) = 7.01` — so this is a transfer failure, not a broken run. That
+distinction is the whole value of having run it: the literature prediction
+(+0.006 AUC, p = 0.63 for this exact protocol) and the corpus argument (~0.8M
+tokens against BabyLM's 10M-word floor) are now supported by a measurement on
+this dataset rather than borrowed.
+
+It also cost **23 minutes**, not the ~8 CPU-hours quoted throughout this report.
+That estimate was for the 2M-parameter default and was never re-derived for the
+334k-parameter model actually shipped — which is most of why it went unrun.
+
+**P2 (bidirectional + masked-token) remains unrun**, deliberately: every tuned
+result here is causal (arm P4), `P4 − P3` = +0.0148 [−0.0033, +0.0318] favours
+causal, and pretraining an architecture that is neither tuned nor shipped would
+not inform the submission.
 
 **4. Staged training for the cutoff augmentation.** Naive pooling is settled
 and negative. Train-broad-then-fine-tune-on-real-cutoffs is a different

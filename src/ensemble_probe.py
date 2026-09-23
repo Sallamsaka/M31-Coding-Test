@@ -91,6 +91,29 @@ def load_val_preds(root: str = ".") -> tuple[dict, np.ndarray, np.ndarray]:
         a = np.load(f)
         if a.shape == y.shape:
             P[Path(f).stem.replace("val_preds_", "")] = a
+
+    # The tuned transformer, as a SEED AVERAGE over the confirmation runs.
+    #
+    # Averaged rather than picked, for two reasons. The cheap one: averaging R
+    # seeds divides the run-to-run noise by sqrt(R), and sigma is 0.0063 against
+    # differences of 0.005 -- a single seed is not a model, it is a draw. The
+    # load-bearing one: selecting the best of the seeds on validation would be
+    # the winner's curse this project measures at +0.038 to +0.051, applied to
+    # the very number we then want to compare against GBDT.
+    #
+    # Only the rank-1 cell is loaded. It was chosen by the fitted design model
+    # BEFORE it was run, and written to the ledger first, so it carries no
+    # validation selection of its own -- which is exactly what makes it
+    # admissible as a candidate here. The 16 design corners are deliberately NOT
+    # loaded: picking the best of them by validation AP would smuggle in a
+    # 16-way maximum and inflate it by ~2.4 sigma.
+    conf = sorted(glob.glob(f"{root}/artifacts/confirm_preds_r1s*.npy"))
+    seeds = [np.load(f) for f in conf]
+    seeds = [a for a in seeds if a.shape == y.shape]
+    if seeds:
+        P["tx_tuned"] = 1.0 / (1.0 + np.exp(
+            -sum(_logit(a) for a in seeds) / len(seeds)))
+        print(f"  tx_tuned = logit-mean of {len(seeds)} confirmation seeds")
     return P, y, ar
 
 

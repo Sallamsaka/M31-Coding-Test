@@ -59,6 +59,12 @@ class TrainConfig:
     threads: int = 8
     pretrain_epochs: int = 8
     eval_every: int = 1
+    # Corruption control (E9.1): permute sequences across patients, keeping
+    # features and labels aligned. IS in the fingerprint, so a control run
+    # cannot resume from the real run's checkpoint and report the real run's
+    # numbers as the control's -- which would make the control conclude "the
+    # encoder does nothing" for entirely the wrong reason (D26/D34/D36).
+    corrupt_seq: bool = False
 
     min_delta: float = 0.0
     """How much dev AP must IMPROVE to count as an improvement.
@@ -149,6 +155,21 @@ class TrainConfig:
     rather than bolted on.
     """
     fusion_dim: int = 64
+    predict_all: bool = False
+    """Also store predictions for EVERY cohort row at the selected epoch.
+
+    Without this, a run keeps only its predictions on the evaluation split, and
+    scoring it on any other set later is impossible -- the weights do not
+    survive either, because artifacts/model_{arm}_seed{seed}.pt is NOT
+    fingerprinted, so 33 arm runs at 3 seeds left 3 files. That is how the whole
+    Phase B ranking ended up unscoreable on our own test set.
+
+    Costs one extra forward pass over 3,514 rows per improving epoch (the model
+    is ~334k parameters, so this is ~1 s) and 562 KB on disk per run. Default
+    False so no existing path changes.
+    """
+    modality_dropout: float = 0.0
+    """See GPTConfig.modality_dropout. 0.0 is inert and is the default."""
     """Deliberately small. A full 3,320 -> 192 projection is 637k parameters,
     a third of the model again, fitted on 2,791 examples. At 64 it is 212k and
     still the largest single block outside the trunk."""
@@ -263,14 +284,41 @@ def pretrain(model: PatientTransformer, pack, rows: np.ndarray, objective: str,
     Running it is how that becomes a result instead of an assumption.
     """
     mask_id = vocab.stoi[MASK]
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.95),
-                            weight_decay=cfg.weight_decay)
+    # Param groups, matching the fine-tuning loop below. A single group applies
+    # weight decay to LayerNorm gains and biases, which is the classic small
+    # bug: those parameters have no scale to shrink toward and decaying them is
+    # just a slow corruption of the normalisation. The fine-tune path already
+    # splits them; pretraining did not, and the asymmetry meant a pretrained
+    # model was regularised differently from the model it initialised.
+    _decay = [q for q in model.parameters() if q.dim() >= 2]
+    _nodecay = [q for q in model.parameters() if q.dim() < 2]
+    opt = torch.optim.AdamW(
+        [{"params": _decay, "weight_decay": cfg.weight_decay},
+         {"params": _nodecay, "weight_decay": 0.0}],
+        lr=cfg.lr, betas=(0.9, 0.95))
     rng = np.random.default_rng(cfg.seed + 1000)
     model.train()
     t0 = time.time()
+
+    # Warmup + cosine, also matching the fine-tune loop. Pretraining previously
+    # ran at a CONSTANT lr with no warmup for its whole budget -- at the arms'
+    # 3.6e-3 that is an aggressive way to start a randomly-initialised model,
+    # and "we pretrained without a schedule and it did not help" is not a result
+    # anyone should accept. Counted in steps so a short run still warms up.
+    _spe = max(1, math.ceil(len(rows) / cfg.batch_size))
+    _total = max(1, epochs * _spe)
+    _warm = max(1, int(cfg.warmup_frac * _total))
+    _step = 0
+
     for epoch in range(epochs):
         tot, nb = 0.0, 0
         for batch in bucketed_batches(pack.lengths, rows, cfg.batch_size, rng):
+            _step += 1
+            _frac = (_step / _warm if _step < _warm else
+                     0.5 * (1.0 + math.cos(math.pi * (_step - _warm)
+                                           / max(1, _total - _warm))))
+            for _g in opt.param_groups:
+                _g["lr"] = cfg.lr * _frac
             tok, dt, _ = _trim(pack.tokens, pack.dt, pack.lengths, batch)
             real = tok != 0
             if objective == "lm":
@@ -379,22 +427,75 @@ def _ckpt_path(root, arm: str, seed: int, fingerprint: str = "") -> Path:
     return Path(root) / "artifacts" / f"ckpt_last_{arm}_seed{seed}{tag}.pt"
 
 
+def _model_path(arm: str, seed: int, fingerprint: str = "") -> str:
+    """Where the deployable best-epoch model goes -- FINGERPRINTED.
+
+    D30: this used to be artifacts/model_{arm}_seed{seed}.pt with no fingerprint,
+    while `_ckpt_path` right next to it did include one. Eleven Phase B arms at
+    three seeds are 33 runs and left **3 files** -- each seed held only the last
+    arm that improved -- so no arm could be re-scored on any other set without
+    retraining all 33. That is half of why the carved test set went unread.
+
+    The path is returned through train()'s result as "model_path" so callers do
+    not have to reconstruct the fingerprint themselves.
+    """
+    tag = f"_{fingerprint[:8]}" if fingerprint else ""
+    return f"artifacts/model_{arm}_seed{seed}{tag}.pt"
+
+
 def _config_fingerprint(cfg: "TrainConfig", arm: str, vocab_size: int,
-                        block_size: int = 0) -> str:
+                        block_size: int = 0, fold_key: str = "",
+                        ex_key: str = "") -> str:
     """What a resume must match. Resuming into a different architecture would
     load the wrong tensors; resuming into a different schedule would continue a
     cosine curve computed for a different horizon. Both fail silently, so the
     fingerprint is checked rather than trusted."""
     import hashlib
+    # modality_dropout is IN the fingerprint. D26 cost this project a silent
+    # cross-resume because `block_size` was left out, and anything that changes
+    # what the weights become must change the checkpoint slot.
     keys = ("n_layer", "n_embd", "n_head", "attn_dropout", "resid_dropout",
-            "fusion", "fusion_dim", "lr", "weight_decay", "epochs",
-            "batch_size", "warmup_frac", "seed", "dev_frac", "holdout_frac",
-            "use_time_encoding", "use_dt_bias")
+            "fusion", "fusion_dim", "modality_dropout", "lr", "weight_decay",
+            "epochs", "batch_size", "warmup_frac", "seed", "dev_frac",
+            "holdout_frac", "use_time_encoding", "use_dt_bias")
     blob = "|".join(f"{k}={getattr(cfg, k)}" for k in keys)
     # block_size too: the ctx256 ablation arm differs from `full` ONLY in it, so
     # without it the two share a fingerprint -- hence a checkpoint slot and a run
     # id. They were indistinguishable to the resume logic.
     blob += f"|arm={arm}|vocab={vocab_size}|block={block_size}"
+    # The fold is part of the configuration: two folds train on different
+    # patients and must not share a checkpoint slot. D26 cost this project a
+    # silent cross-resume for exactly this reason, from `block_size` being left
+    # out. `vocab_size` already varies with the fold, which would catch most
+    # collisions, but "most" is what D26 was.
+    blob += f"|foldkey={fold_key}"
+    # The ExampleConfig too. Augmentation changes the TRAINING SET while leaving
+    # every fingerprinted field identical -- same architecture, same schedule,
+    # same seed, and the vocabulary is unchanged because the patients and codes
+    # are the same. So an augmented run and its un-augmented twin shared a
+    # fingerprint, hence a `_model_path`, and `_try_resume` would have loaded
+    # the un-augmented weights and reported "augmentation does nothing".
+    #
+    # D26 and D34 are the same bug twice; this is the third site. Appended only
+    # when non-empty, so the default ExampleConfig keeps its existing
+    # fingerprints and no completed checkpoint is orphaned.
+    if ex_key:
+        blob += f"|ex={ex_key}"
+    # The corruption control changes what the weights become, so it needs its
+    # own checkpoint slot -- otherwise it resumes from the real run and reports
+    # the real run's numbers as the control's, which would make the control
+    # say "the encoder does nothing" for the wrong reason. D26/D34/D36.
+    if getattr(cfg, "corrupt_seq", False):
+        blob += "|corrupt_seq=1"
+    # The pretraining objective and budget change what the weights become, so
+    # they identify the checkpoint. Without this, P1 at 8 pretraining epochs and
+    # P1 at 4 share a slot and a run id -- and a resumed run would load the
+    # wrong warm-up while reporting the requested one. D26/D34/D36, a fourth
+    # time. Appended only when pretraining is on, so P3/P4 fingerprints are
+    # unchanged and no existing checkpoint is orphaned.
+    _pre = ARMS.get(arm, {}).get("pretrain")
+    if _pre is not None:
+        blob += f"|pretrain={_pre}:{getattr(cfg, 'pretrain_epochs', 0)}"
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -484,7 +585,28 @@ def _try_resume(path: Path, *, model, opt, rng, fingerprint: str, verbose: bool)
 
 def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = None,
           ex_cfg: ExampleConfig | None = None, seq_cfg: SeqConfig | None = None,
-          max_steps: int | None = None, verbose: bool = True) -> dict:
+          max_steps: int | None = None, verbose: bool = True,
+          fold_pids: set | None = None) -> dict:
+    """Train one transformer arm.
+
+    ``fold_pids`` restricts the training pool to exactly those patients, for
+    cross-validation. Default None keeps the existing behaviour bit-for-bit:
+    the pool is `cv.trainable_pids`, i.e. train minus the 358-patient test set.
+
+    **Why this exists.** The transformer has never been cross-validated --
+    `cross_validate.MODELS` is prevalence/trivial/lr_default/lr/gbdt -- so every
+    comparison involving it has been made on the 365-patient validation set,
+    while LR and GBDT have 2,433-row out-of-fold estimates. There was no way to
+    restrict `train()` to a fold; this is it.
+
+    **The epoch is still selected on the provided validation set**, which is
+    disjoint from every fold, so it leaks nothing into the out-of-fold rows. It
+    is a fixed selection set shared across folds, which makes that particular
+    optimism common-mode across them rather than fold-specific. Carving an inner
+    dev split per fold would remove even that, at the cost of a third split and
+    less training data per fold; it is not worth it while the folds are only
+    1,946 patients.
+    """
     cfg = cfg or TrainConfig()
     seq_cfg = seq_cfg or SeqConfig()
     spec = ARMS[arm]
@@ -505,8 +627,39 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
         all_train = set(coh.loc[coh.split == "train", "pid"].tolist())
         fit_pids = all_train - dev_pids - hold_pids
 
+    if fold_pids is not None:
+        # D17 again: the vocabulary must not see patients outside the fit pool,
+        # or the fold's own held-out patients help decide which codes clear
+        # `min_patients_per_code` and where the decile edges fall. Measured at
+        # dev_frac=0.2: 36 of 1,105 tokens were admitted by held-out patients
+        # alone.
+        fit_pids = set(fold_pids)
     vocab = build_vocab(root, seq_cfg, fit_pids=fit_pids)
     pack = build_sequences(root, vocab, seq_cfg, ex_cfg)
+
+    # CORRUPTION CONTROL (E9.1 owed one). Permute which patient's SEQUENCE goes
+    # with which patient's features and labels, leaving everything else intact.
+    #
+    # What it answers: does the sequence encoder contribute anything, or is this
+    # a feature-MLP with a decorative transformer bolted on? Under corruption the
+    # encoder sees a stranger's history, so any score above the features-only
+    # level must be coming from the features. If the corrupted model scores the
+    # same as the real one, the encoder was never contributing.
+    #
+    # This is the control the existing shuffled-LABEL test cannot provide: both
+    # leaks this project actually found (D17 vocabulary, D18 features) were
+    # invisible to it, because neither path reads `y`. Corrupting the INPUT
+    # tests the path that those leaks lived on.
+    if getattr(cfg, "corrupt_seq", False):
+        _rng = np.random.default_rng(12345 + cfg.seed)
+        _perm = _rng.permutation(len(pack.tokens))
+        assert not np.array_equal(_perm, np.arange(len(_perm))), "permutation is a no-op"
+        from dataclasses import replace as _replace
+        pack = _replace(pack, tokens=pack.tokens[_perm], dt=pack.dt[_perm],
+                        lengths=pack.lengths[_perm])
+        if verbose:
+            print("  ⚠ CORRUPTION CONTROL: sequences permuted across patients",
+                  flush=True)
     lab = load_labels(root, ex_cfg)
     y = lab["y"].astype(np.float32)
     ar = at_risk_mask(lab).astype(np.float32)
@@ -515,7 +668,7 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
     # Training rows EXCLUDE the locked test set. `pack.split == "train"` is
     # 2,791 patients and includes the locked 358.
     from .cv import trainable_pids
-    _pool = trainable_pids(str(root))
+    _pool = trainable_pids(str(root)) if fold_pids is None else set(fold_pids)
     tr = np.flatnonzero((pack.split == "train")
                         & np.isin(pack.pid, list(_pool)))
     va = np.flatnonzero(pack.split == "val")
@@ -575,6 +728,7 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
         attn_dropout=cfg.attn_dropout, resid_dropout=cfg.resid_dropout,
         use_time_encoding=cfg.use_time_encoding, use_dt_bias=cfg.use_dt_bias,
         fusion=cfg.fusion, fusion_dim=cfg.fusion_dim,
+        modality_dropout=cfg.modality_dropout,
         n_features=(feats.shape[1] if feats is not None else 0)))
 
     decay = [p for n, p in model.named_parameters() if p.dim() >= 2]
@@ -589,20 +743,25 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
     total = steps_per_epoch * cfg.epochs if max_steps is None else max_steps
     warm = max(1, int(cfg.warmup_frac * total))
 
-    if spec["pretrain"] is not None:
-        # A smoke run must exercise the pretraining path, not sit in it: with
-        # `max_steps` set we are checking the code runs, not training anything.
-        pretrain(model, pack, tr, spec["pretrain"], cfg, vocab,
-                 epochs=cfg.pretrain_epochs, verbose=verbose,
-                 max_steps=(5 if max_steps is not None else None))
-
     # The run id must distinguish CONFIGURATIONS, not just arm and seed. All
     # five learning-rate points of the basin sweep run as arm=P4, seed=0, so
     # under the old name they logged as one run and 220 epochs of five
     # different learning rates appeared as a single trajectory -- which makes
     # any per-run variance or convergence analysis meaningless. The fingerprint
     # already covers architecture, schedule, seed, arm and vocabulary.
-    fingerprint = _config_fingerprint(cfg, arm, len(vocab), seq_cfg.block_size)
+    # A stable digest of the fold membership, not the fold index: two runs
+    # with the same index but different partitions (fold_masks(repeat=N))
+    # must not collide.
+    _fk = ("" if fold_pids is None else
+           __import__("hashlib").sha256(
+               ",".join(map(str, sorted(fold_pids))).encode()).hexdigest()[:12])
+    # "" for the default config, so existing checkpoints stay addressable.
+    _default_ex = type(ex_cfg)()
+    _ek = ("" if ex_cfg == _default_ex
+           else __import__("hashlib").sha256(
+               repr(asdict(ex_cfg)).encode()).hexdigest()[:12])
+    fingerprint = _config_fingerprint(cfg, arm, len(vocab),
+                                      seq_cfg.block_size, _fk, _ek)
 
     run = wandb_shim.init(f"{arm}_seed{cfg.seed}_{fingerprint[:8]}",
                           {"arm": arm, **spec, **asdict(cfg),
@@ -622,6 +781,24 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
         start_epoch, step, best = _try_resume(
             ckpt, model=model, opt=opt, rng=rng, fingerprint=fingerprint,
             verbose=verbose)
+
+    # Pretraining happens HERE, after the resume attempt, and only when there
+    # was nothing to resume.
+    #
+    # It used to run before the resume check, which meant a resumed run paid
+    # the full pretraining cost and then overwrote every pretrained weight with
+    # the checkpoint's -- the whole warm-up discarded, silently, on any run that
+    # had been interrupted. The checkpoint already contains post-pretraining
+    # weights, so re-doing it is not just wasted, it is wrong.
+    if spec["pretrain"] is not None and start_epoch == 0:
+        # A smoke run must exercise the pretraining path, not sit in it: with
+        # `max_steps` set we are checking the code runs, not training anything.
+        pretrain(model, pack, tr, spec["pretrain"], cfg, vocab,
+                 epochs=cfg.pretrain_epochs, verbose=verbose,
+                 max_steps=(5 if max_steps is not None else None))
+    elif spec["pretrain"] is not None and verbose:
+        print(f"  resumed at epoch {start_epoch}; skipping pretraining "
+              "(the checkpoint already carries it)", flush=True)
     t0 = time.time()
     for epoch in range(start_epoch, cfg.epochs):
         model.train()
@@ -732,6 +909,16 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
             if improved:
                 best = {"epoch": epoch + 1, "macro_auroc": au, "macro_ap": apv,
                         "preds": P.copy()}
+                if cfg.predict_all:
+                    # Every row, so this run can be scored on ANY subset later --
+                    # our carved test set, a different fold, a slice. Computed
+                    # here rather than at the end because the end would need the
+                    # best-epoch weights reloaded, and that file is overwritten
+                    # by the next run at the same seed.
+                    _all = np.arange(len(pack.pid))
+                    best["all_preds"] = predict(model, pack.tokens, pack.dt,
+                                                pack.lengths, _all,
+                                                features=feats)
                 # The reported score is a MAX over epochs taken on the very set
                 # that selects the epoch, so it carries a winner's curse of the
                 # same shape as the one G1 measures on validation. It is not
@@ -763,7 +950,7 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
                                 "arm": arm, "spec": spec, "seed": cfg.seed,
                                 "epoch": epoch + 1, "vocab_size": len(vocab),
                                 "val_macro_auroc": au, "val_macro_ap": apv},
-                               f"artifacts/model_{arm}_seed{cfg.seed}.pt")
+                               _model_path(arm, cfg.seed, fingerprint))
 
             # Resume state EVERY eval epoch, improved or not -- an interrupted
             # run must restart from where it stopped, not from its best epoch.
@@ -787,9 +974,11 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
     if max_steps is None:
         ckpt.unlink(missing_ok=True)
 
-    return {"arm": arm, "seed": cfg.seed, **{k: v for k, v in best.items()
-                                             if k != "preds"},
-            "preds": best.get("preds"), "epochs_run": epoch + 1,
+    return {"arm": arm, "seed": cfg.seed,
+            **{k: v for k, v in best.items() if k not in ("preds", "all_preds")},
+            "preds": best.get("preds"), "all_preds": best.get("all_preds"),
+            "model_path": _model_path(arm, cfg.seed, fingerprint),
+            "epochs_run": epoch + 1,
             "minutes": (time.time() - t0) / 60}
 
 

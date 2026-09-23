@@ -72,17 +72,33 @@ def _features(root, ex_cfg, fit_rows, tr_rows, n_rows):
     return (X / np.where(scale > 0, scale, 1.0)).astype(np.float32), fmat
 
 
-def main(root: str = ".", arm: str = "P4", seed: int = 0) -> None:
+# Config (1), the design's predicted-best cell. The original run used the
+# dataclass defaults (4L/d192) because that is what existed at the time.
+CONFIG_1 = dict(n_layer=1, n_embd=64, n_head=2, lr=0.0036, weight_decay=0.001,
+                attn_dropout=0.0, resid_dropout=0.0)
+
+
+def main(root: str = ".", arm: str = "P4", seed: int = 0,
+         config: dict | None = None, epochs: int = 12) -> None:
     seq_cfg = SeqConfig()
     ex_cfg = ExampleConfig()
-    cfg = TrainConfig(seed=seed, dev_frac=0.2, fusion="readout", epochs=12)
+    # dev_frac=0.2 is kept: this scores on the inner dev split (n=558), so it
+    # costs no validation reads and stays comparable to E16's original run.
+    cfg = TrainConfig(seed=seed, dev_frac=0.2, fusion="readout", epochs=epochs,
+                      **(config or {}))
+    print("config: %s" % {k: getattr(cfg, k) for k in
+                          ("n_layer", "n_embd", "n_head", "lr", "weight_decay",
+                           "attn_dropout", "fusion")}, flush=True)
 
     print("training a fused model (fusion=readout, dev_frac=0.2) ...", flush=True)
     res = train(arm, root, cfg, ex_cfg, seq_cfg, verbose=True)
     print(f"  trained: best epoch {res['epoch']}, dev AUROC {res['macro_auroc']:.4f}, "
           f"AP {res['macro_ap']:.4f}, {res['minutes']:.1f} min\n", flush=True)
 
-    ckpt = torch.load(f"{root}/artifacts/model_{arm}_seed{seed}.pt", weights_only=False)
+    # The path comes back from train() rather than being rebuilt here: it is
+    # fingerprinted now (D30), and reconstructing the fingerprint at the call
+    # site is exactly the duplicated-derivation bug of D27.
+    ckpt = torch.load(f"{root}/{res['model_path']}", weights_only=False)
     model = PatientTransformer(GPTConfig(**ckpt["gpt_config"]))
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
@@ -153,5 +169,17 @@ def main(root: str = ".", arm: str = "P4", seed: int = 0) -> None:
     print(f"  VERDICT: {verdict}")
 
 
+def _cli() -> None:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config-1", action="store_true",
+                    help="run at the design's predicted-best cell (1L/64/2)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--epochs", type=int, default=12)
+    a = ap.parse_args()
+    main(".", seed=a.seed, config=(CONFIG_1 if a.config_1 else None),
+         epochs=a.epochs)
+
+
 if __name__ == "__main__":
-    main()
+    _cli()

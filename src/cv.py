@@ -57,7 +57,18 @@ SPLIT_SEED = 12345
 # its precision equals what the real test would give -- which is the entire
 # point of a proxy. 15% (419) was an arbitrary choice that made ours 61
 # patients larger than the thing it stands in for.
-LOCKED_TEST_N = 358
+# RETIRED -- 0, so nothing is carved and the CV pool is the full 2,791.
+#
+# The carve existed to give a clean fixed holdout. It is redundant: CV already
+# rotates the test set, and the provided val is a fixed yardstick we are
+# forbidden to train on anyway, so holding THAT out is free. This one cost 12.8%
+# of the training pool (2,791 -> 2,433), worth about -0.005 AUROC on every model
+# by §B1's learning curve, paid continuously.
+#
+# What replaces its one real use -- a cheap clean set to screen transformer arms
+# on -- is fold 0 of the standard partition: arms train on folds 1-4 and score on
+# fold 0. Part of the design rather than a separate carve, and it rotates.
+LOCKED_TEST_N = 0
 LOCKED_TEST_FRAC = LOCKED_TEST_N / 2791
 
 
@@ -80,13 +91,18 @@ def locked_test_pids(root: str = ".", frac: float = LOCKED_TEST_FRAC) -> set[int
     re-check coverage before trusting it.
     """
     pids = _train_pids(root)
-    order = np.random.default_rng(SPLIT_SEED).permutation(pids)
     n = LOCKED_TEST_N if frac == LOCKED_TEST_FRAC else int(round(frac * len(pids)))
+    # RETIRED: n is 0, and `order[-0:]` is the WHOLE array, not an empty one --
+    # so this must return early rather than slice. Getting that wrong would
+    # silently carve out every training patient.
+    if n <= 0:
+        return set()
+    order = np.random.default_rng(SPLIT_SEED).permutation(pids)
     return set(order[-n:].tolist())
 
 
 def cv_pool_pids(root: str = ".", frac: float = LOCKED_TEST_FRAC) -> np.ndarray:
-    """Train patients minus the locked test set. Everything else fits here."""
+    """The CV pool: now ALL 2,791 train patients (the carve is retired)."""
     pids = _train_pids(root)
     locked = locked_test_pids(root, frac)
     return np.sort(np.array([p for p in pids if p not in locked]))
@@ -110,6 +126,76 @@ def trainable_row_mask(ex, root: str = ".", frac: float = LOCKED_TEST_FRAC):
     pool = trainable_pids(root, frac)
     is_train = (ex.split == "train").to_numpy()
     return is_train & np.isin(ex.pid.to_numpy(), list(pool))
+
+
+def stratified_fold_of(Y, n_splits: int = 5, seed: int = SPLIT_SEED):
+    """Assign patients to folds balancing PER-LABEL positive counts.
+
+    Greedy iterative stratification (Sechidis, Tsoumakas & Vlahavas 2011), which
+    is the multi-label analogue of a stratified split: a patient carries several
+    labels at once, so you cannot stratify on one without unbalancing the rest.
+
+    **The problem it fixes, measured.** Random patient-grouped folds already match
+    the provided test set on every distributional axis -- events (KS p = 0.37 to
+    0.96), history length, gap-to-anchor, age, sex, race, per-label prevalence --
+    so none of that needs correcting. What they do NOT control is the rare-label
+    tail: fold 1 of the current partition holds a label with **one positive**. A
+    per-label AP on one positive is a coin flip, and macro AP averages all 40 with
+    equal weight, so that fold's headline number is part noise. A fold with ZERO
+    positives is worse still: the label is dropped and the macro silently averages
+    over a different set of labels (§G1).
+
+    Rarest labels are placed first, because they are the constrained ones -- once
+    a label with 29 positives is spread, the common labels have enough mass to
+    balance around it. Ties break toward the fold holding fewest patients, which
+    keeps the folds near-equal in size without a separate balancing pass.
+
+    ⚠ **WRITTEN, MEASURED, AND DELIBERATELY NOT ADOPTED.** `fold_masks` does not
+    call this. It raises the per-label floor exactly as intended -- worst label
+    across five folds goes 3 -> 5 against an ideal of 5.8, with fold sizes
+    unchanged -- and the decision was still to keep random assignment.
+
+    The reason is what the folds are *for*. They simulate the provided test set,
+    which is one random draw of 358 patients, and a random draw can perfectly
+    well land 1 positive on a rare label. Stratifying removes that possibility,
+    so every fold becomes more stable than the thing it stands in for, and any
+    spread reported across folds understates the spread we will actually face.
+    Lower estimator variance is the right trade when selecting; a faithful
+    simulation is the right trade when the number is meant to predict the
+    deliverable. Here it is the latter.
+
+    Kept because it is correct and tested, and because the trade flips if the
+    folds are ever used purely for selection rather than for prediction.
+
+    Returns an integer fold index per row of ``Y``.
+    """
+    Y = np.asarray(Y)
+    n, L = Y.shape
+    rng = np.random.default_rng(seed)
+    totals = Y.sum(0)
+    remaining = np.tile(totals / n_splits, (n_splits, 1)).astype(float)
+    count = np.zeros(n_splits, int)
+    assign = np.full(n, -1, int)
+
+    for j in np.argsort(totals):                 # rarest label first
+        members = np.flatnonzero((Y[:, j] == 1) & (assign < 0))
+        rng.shuffle(members)
+        for i in members:
+            need = remaining[:, j]
+            cand = np.flatnonzero(need == need.max())
+            k = int(cand[np.argmin(count[cand])])
+            assign[i] = k
+            remaining[k] -= Y[i]
+            count[k] += 1
+
+    leftover = np.flatnonzero(assign < 0)        # patients with no positives
+    rng.shuffle(leftover)
+    for i in leftover:
+        k = int(np.argmin(count))
+        assign[i] = k
+        count[k] += 1
+    assert (assign >= 0).all()
+    return assign
 
 
 def fold_masks(root: str = ".", n_splits: int = 5, repeat: int = 0,

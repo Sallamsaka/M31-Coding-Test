@@ -172,6 +172,8 @@ def report(res: pd.DataFrame, metric: str, q: float = 0.15) -> None:
             "sigma", "p_onesided", "q_bh", "shrunken", "n_pairs"]
     cols = [c for c in cols if c in res.columns]
     print(res[cols].to_string(index=False, float_format=lambda v: f"{v:+.5f}"))
+    if q is None:
+        q = float(res.q_level.iloc[0]) if "q_level" in res.columns else 0.15
     k = int(res.passes_bh.sum())
     print(f"\n  {k}/{len(res)} pass one-sided BH at q={q}. "
           f"Act on `shrunken`, not on `effect`, and not on this column.")
@@ -188,7 +190,8 @@ def report(res: pd.DataFrame, metric: str, q: float = 0.15) -> None:
 
 def orthogonal_effects(df: pd.DataFrame, coded: list[str], metric: str,
                        sigma_pure: float | None = None,
-                       n_pure: int = 0) -> pd.DataFrame:
+                       n_pure: int = 0,
+                       interactions: bool = True) -> pd.DataFrame:
     """Main effects of an ORTHOGONAL design, by contrast rather than by pairing.
 
     **Why `paired_effects` cannot be used here, found by testing before running.**
@@ -227,12 +230,29 @@ def orthogonal_effects(df: pd.DataFrame, coded: list[str], metric: str,
     """
     out = []
     n = len(df)
-    for c in coded:
-        v = df[c].to_numpy()
-        hi, lo = df.loc[v > 0, metric], df.loc[v < 0, metric]
+    y = df[metric].to_numpy(float)
+
+    # Main effects, then every two-factor interaction. Resolution V makes the
+    # interactions estimable and unaliased, which was the design's whole reason
+    # for existing -- reporting only main effects throws that away.
+    #
+    # They also fix Lenth's PSE, whose degrees of freedom are m/3: five main
+    # effects give d = 1 and t(0.975, 1) = 12.7, a margin of error of 0.078 that
+    # no effect on this scale could exceed. That is not "nothing is resolvable",
+    # it is "the estimator had no degrees of freedom". With the ten interactions
+    # included, m = 15 and d = 5.
+    contrasts = [(c, df[c].to_numpy(float)) for c in coded]
+    if interactions:
+        base = list(contrasts)
+        for (a_, va), (b_, vb) in itertools.combinations(base, 2):
+            contrasts.append((f"{a_}:{b_}", va * vb))
+
+    for name, v in contrasts:
+        hi, lo = y[v > 0], y[v < 0]
         if len(hi) == 0 or len(lo) == 0:
             continue
-        out.append({"factor": c, "effect": float(hi.mean() - lo.mean()),
+        out.append({"factor": name, "effect": float(hi.mean() - lo.mean()),
+                    "kind": "interaction" if ":" in name else "main",
                     "n_hi": len(hi), "n_lo": len(lo)})
     res = pd.DataFrame(out)
     if res.empty:
@@ -248,12 +268,20 @@ def orthogonal_effects(df: pd.DataFrame, coded: list[str], metric: str,
     # Pooling the interactions is also what makes the sparsity assumption
     # reasonable: it is the interactions that are mostly null, and they are the
     # reference distribution the main effects are being judged against.
+    # BUG, caught by the printed df disagreeing with the margin of error
+    # actually used: when `interactions=True` the loop below rebuilt the same
+    # ten two-factor contrasts that `res` already holds, so every interaction
+    # entered the pool TWICE -- 25 entries instead of 15, df 8 instead of 5,
+    # and a PSE median double-weighted toward the interactions. The report
+    # printed "df = 5" while `margin_of_error` had been computed at df = 8
+    # (t = 2.31, not 2.57), which is how it was noticed.
     pool = list(res.effect.to_numpy())
-    for a, b in itertools.combinations(coded, 2):
-        v = (df[a] * df[b]).to_numpy()
-        hi_i, lo_i = df.loc[v > 0, metric], df.loc[v < 0, metric]
-        if len(hi_i) and len(lo_i):
-            pool.append(float(hi_i.mean() - lo_i.mean()))
+    if not interactions:
+        for a, b in itertools.combinations(coded, 2):
+            v = (df[a] * df[b]).to_numpy()
+            hi_i, lo_i = df.loc[v > 0, metric], df.loc[v < 0, metric]
+            if len(hi_i) and len(lo_i):
+                pool.append(float(hi_i.mean() - lo_i.mean()))
     e = np.asarray(pool)
     s0 = 1.5 * np.median(np.abs(e))
     small = np.abs(e)[np.abs(e) < 2.5 * s0] if s0 > 0 else np.abs(e)
@@ -261,6 +289,11 @@ def orthogonal_effects(df: pd.DataFrame, coded: list[str], metric: str,
     res["lenth_pse"] = pse
     res["lenth_n_contrasts"] = len(e)
     d_lenth = max(1, len(e) // 3)
+    # Stored rather than recomputed downstream. The reporter used to derive it
+    # from len(res), which is a DIFFERENT quantity whenever the pool and the
+    # reported rows differ -- and that silent disagreement is what hid the
+    # double-counting above.
+    res["lenth_df"] = d_lenth
     res["t_lenth"] = res.effect / pse if pse > 0 else np.nan
     res["p_lenth"] = 2 * stats.t.sf(np.abs(res.t_lenth), df=d_lenth)
     res["margin_of_error"] = stats.t.ppf(0.975, d_lenth) * pse
@@ -274,27 +307,97 @@ def orthogonal_effects(df: pd.DataFrame, coded: list[str], metric: str,
         res["ci_hi"] = res.effect + stats.t.ppf(0.975, n_pure - 1) * se
         res["shrunken"] = shrink(res.effect.to_numpy(),
                                  np.full(len(res), se))
+        res = _bh(res, "p_pure")
     else:
         # `e` is the 15-contrast Lenth POOL; shrinkage applies to the main
         # effects only, which is what `res` holds.
         main = res.effect.to_numpy()
         res["shrunken"] = shrink(main, np.full(len(main), pse if pse > 0 else 1.0))
+        res = _bh(res, "p_lenth")
 
     return res.reindex(res.effect.abs().sort_values(ascending=False).index
                        ).reset_index(drop=True)
 
 
-def report_orthogonal(res: pd.DataFrame, metric: str) -> None:
+def _bh(res: pd.DataFrame, pcol: str, q: float = 0.15) -> pd.DataFrame:
+    """Benjamini-Hochberg over every contrast in a fractional design.
+
+    The fractional path had no multiplicity control at all while the full
+    factorial path had BH at q=0.15 -- and it is the fractional path that
+    reports FIFTEEN effects at once. Uncorrected, nine of fifteen AUROC
+    contrasts "excluded zero", which is not a plausible state of the world;
+    it is what 15 nominal 95% intervals do.
+
+    Two-sided here, unlike `paired_effects`, and on firmer ground rather than
+    weaker. `paired_effects` needs the one-sided restriction because its
+    contrasts are correlated, which is outside BH 1995 and only inside
+    Benjamini-Yekutieli's studentized case. A resolution-V design's contrasts
+    are **exactly orthogonal by construction** and share one iid error term, so
+    the p-values are independent and BH 1995's original independence proof
+    applies directly, in either direction. A negative effect is as actionable
+    as a positive one here: "dropout hurts" tells us to set it low.
+    """
+    if pcol not in res.columns:
+        return res
+    r = res.sort_values(pcol).reset_index(drop=True)
+    m = len(r)
+    raw = r[pcol].to_numpy() * m / (np.arange(m) + 1)
+    r["q_bh"] = np.minimum.accumulate(raw[::-1])[::-1].clip(0, 1)
+    r["passes_bh"] = r["q_bh"] <= q
+    # STORED, so the reporter prints the q that was actually applied instead of
+    # its own default. Two independent defaults for one threshold is precisely
+    # the defect of D27 -- there it was Lenth's df derived twice and the two
+    # copies drifting apart unnoticed. Changing q here would otherwise leave
+    # `report_orthogonal` announcing 0.15 while `passes_bh` used something else.
+    r["q_level"] = q
+    return r
+
+
+def report_orthogonal(res: pd.DataFrame, metric: str,
+                      q: float | None = None) -> None:
     if res.empty:
         print("  no factors to contrast")
         return
     print(f"\n=== MAIN EFFECTS on {metric} (orthogonal contrasts) ===")
-    cols = [c for c in ("factor", "effect", "ci_lo", "ci_hi", "se_pure",
-                        "lenth_pse", "t_lenth", "p_lenth", "shrunken")
+    cols = [c for c in ("factor", "kind", "effect", "ci_lo", "ci_hi", "se_pure",
+                        "lenth_pse", "t_lenth", "p_lenth", "q_bh", "shrunken")
             if c in res.columns]
     print(res[cols].to_string(index=False, float_format=lambda v: f"{v:+.5f}"))
     moe = float(res.margin_of_error.iloc[0])
     big = res.loc[res.effect.abs() > moe, "factor"].tolist()
-    print(f"\n  Lenth margin of error (95%): {moe:.5f}")
-    print(f"  exceeding it: {big if big else 'none -- no effect is resolvable'}")
+    d_lenth = int(res.lenth_df.iloc[0]) if "lenth_df" in res.columns else 1
+    n_pool = int(res.lenth_n_contrasts.iloc[0])
+    print(f"\n  Lenth margin of error (95%): {moe:.5f}  "
+          f"(pooled over {n_pool} contrasts, df = {d_lenth})")
+    if d_lenth <= 2:
+        print(f"  WARNING: too few effects for Lenth. t(0.975, {d_lenth}) is "
+              "enormous, so this margin")
+        print("  rejects everything regardless of the data. Read the pure-error "
+              "interval instead.")
+    print(f"  exceeding it: {big if big else 'none'}")
+    if "ci_lo" in res.columns:
+        pe = res[(res.ci_lo > 0) | (res.ci_hi < 0)].factor.tolist()
+        print(f"  excluding zero by PURE ERROR (uncorrected): "
+              f"{pe if pe else 'none'}")
+    if "passes_bh" in res.columns:
+        bh = res.loc[res.passes_bh, "factor"].tolist()
+        print(f"  surviving BH at q={q} across all {len(res)} contrasts: "
+              f"{bh if bh else 'none'}")
+        k = len(bh)
+        print("  BH names MORE than the uncorrected line, and that is correct,"
+              " not a bug:")
+        print("  the two control different things. The line above is"
+              " per-comparison alpha=0.05")
+        print(f"  applied {len(res)} times, so ~{0.05 * len(res):.1f} of its"
+              f" entries are expected to be")
+        print(f"  false with no true effect at all. BH at q={q} instead bounds"
+              f" the expected")
+        print(f"  FALSE-DISCOVERY PROPORTION *within the named set*: of these"
+              f" {k}, at most ~{q * k:.1f}")
+        print("  are expected to be spurious. That is the screening trade BH"
+              " 1995 recommends")
+        print("  for 2^k designs -- a deliberately permissive q, bought with a"
+              " bound on how")
+        print("  much of the harvest is chaff. Quote BH; do not read it as the"
+              " stricter test.")
     print("  Act on `shrunken`. 'Not resolvable' is a result, not a failure.")

@@ -86,6 +86,24 @@ class GPTConfig:
     fusion_dim: int = 64
     n_features: int = 0
 
+    modality_dropout: float = 0.0
+    """Probability of zeroing the WHOLE feature vector for an example, in training.
+
+    Not the same thing as `resid_dropout` inside `feat_proj`, which drops
+    individual units and leaves the tabular branch informative. This drops the
+    branch entirely for a random subset of examples per step, so the sequence
+    branch has to be able to carry the prediction alone.
+
+    Two reasons it earns a switch here. §E16 named "auxiliary sequence-only
+    loss, modality dropout" as the fixes if the collapse check had failed, and
+    implemented neither. And §E25.2 measured the model as OVERFITTING rather
+    than under-trained, which makes a regulariser the right class of
+    intervention -- this one happening to also attack the fact that
+    `Linear(3296, 64)` is 211k parameters against a ~123k-parameter trunk.
+
+    0.0 reproduces the previous behaviour exactly, so it is inert until set.
+    """
+
     use_time_encoding: bool = True
     """Ablation switch: include the per-token Time2Vec encoding at all.
 
@@ -344,6 +362,26 @@ class PatientTransformer(nn.Module):
                 lengths: torch.Tensor,
                 features: torch.Tensor | None = None) -> torch.Tensor:
         """Logits per example, from whichever readout the mask implies."""
+        # Applied once, HERE, rather than inside each fusion branch: both
+        # `readout` and `token` consume `features` downstream, so dropping it at
+        # the entry point guarantees the two modes get identical treatment. A
+        # per-branch implementation would be two chances to make them differ.
+        #
+        # Training only -- `self.training` is what makes evaluation
+        # deterministic, and the mask is per-EXAMPLE (shape (B, 1)) not per-unit,
+        # which is the whole distinction from `resid_dropout`.
+        #
+        # Deliberately NOT rescaled by 1/(1-p). Standard inverted dropout keeps
+        # the expected input to the next layer constant, but here the point is
+        # that the sequence branch must cope with the feature branch being
+        # genuinely absent -- which is exactly the condition at `features=0` in
+        # the collapse check. Rescaling would train it on a reweighted vector it
+        # never sees at evaluation.
+        if (self.training and self.cfg.modality_dropout > 0
+                and features is not None):
+            keep = (torch.rand(features.shape[0], 1, device=features.device)
+                    >= self.cfg.modality_dropout).to(features.dtype)
+            features = features * keep
         if self.cfg.fusion == "token" and features is not None:
             # The feature token must sit at the OLDEST instant, not dt = 0.
             #

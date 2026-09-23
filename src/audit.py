@@ -212,6 +212,50 @@ def audit_predictions(root: Path) -> None:
               f"ratio {exp/max(obs,1e-9):>5.2f}x")
     _say(OK, "ratio far from 1.0 means miscalibration, which rank metrics hide")
 
+    # The SHIPPED file, which is the only artefact that leaves this repository.
+    #
+    # Everything above scores `baseline_val_preds.npz`, which `run_baseline`
+    # writes BEFORE the calibration step -- so this section was structurally
+    # blind to calibration and reported the shipped blend as uncalibrated. An
+    # audit that cannot see the last transform applied to the deliverable is
+    # auditing something other than the deliverable.
+    sub_f = root / "outputs" / "predictions.csv"
+    meta_f = root / "outputs" / "predictions_meta.json"
+    if not sub_f.exists():
+        _say(WARN, "no outputs/predictions.csv to audit")
+        return
+    import json
+
+    import pandas as pd
+    sub = pd.read_csv(sub_f)
+    codes = [c for c in sub.columns if c != sub.columns[0]]
+    V = sub[codes].to_numpy(float)
+    te = lab["split"] == "test"
+    ar_te = ar[te]
+
+    # Train at-risk positive rate is the reference: a calibrated model should
+    # predict close to it on average, if the test population resembles train.
+    tr = lab["split"] == "train"
+    base = float((y[tr] * ar[tr]).sum() / max(ar[tr].sum(), 1))
+    if V.shape == ar_te.shape:
+        mean_ar = float(V[ar_te.astype(bool)].mean())
+        print(f"     SHIPPED predictions.csv  mean(at-risk) {mean_ar:.4f} "
+              f"vs train rate {base:.4f}  ratio {mean_ar/max(base,1e-9):>5.2f}x")
+        n_floor = int((V <= 1.5e-6).sum())
+        n_exp = int((~ar_te.astype(bool)).sum())
+        _say(OK if n_floor == n_exp else WARN,
+             f"not-at-risk cells floored: {n_floor:,} (expected {n_exp:,})")
+    else:
+        _say(WARN, f"predictions.csv shape {V.shape} != at-risk {ar_te.shape}")
+
+    if meta_f.exists():
+        m = json.loads(meta_f.read_text(encoding="utf-8"))
+        _say(OK if m.get("recipe") else WARN,
+             f"recipe recorded: {m.get('recipe', 'MISSING')}")
+        _say(OK if m.get("calibrated") else WARN,
+             f"calibrated: {m.get('calibrated')} "
+             f"({m.get('n_labels_calibrated', 0)}/40 labels)")
+
 
 # ---------------------------------------------------------------- F -------
 def audit_loss_masking(root: Path) -> None:

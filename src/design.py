@@ -258,8 +258,8 @@ def report_sigma(out: dict) -> None:
     print("\n  minimum detectable effect at 80% power:")
     for N in (16, 20, 32):
         print(f"    N={N:<3} -> {out[f'mde_N{N}']:.4f} macro AUROC")
-    print(f"\n  For scale, the whole measured spread of this project is "
-          f"0.0061 to 0.0148.")
+    print("\n  For scale, the whole measured spread of this project is "
+          "0.0061 to 0.0148.")
     if out["mde_N20"] > 0.02:
         print("  VERDICT: a 20-run design detects nothing this project cares about.")
         print("           Cut to 3 factors, or accept 'not resolvable' as the result.")
@@ -448,6 +448,15 @@ def propose_config(df, metric="macro_ap", shrink_it=True):
         # parameters leaves ZERO residual degrees of freedom. The replicated
         # centre points exist precisely for this, and with orthogonal +-1 coding
         # SE(coef) = sigma_pure / sqrt(n).
+        # DELIBERATELY the centre-only sigma, not the pooled 7-df estimate
+        # that `analyse_design` now uses. Shrinkage strength depends on it, so
+        # switching would move every predicted cell -- and the top cell's
+        # prediction has already been pre-registered in the ledger and in
+        # docs/PRE-REGISTRATION.md as the thing the confirmation runs test.
+        # Changing the estimator after recording the prediction and before
+        # reading the result is a forking path, and a small one is still one.
+        # Revisit only after the confirmation has been scored, as a stated
+        # deviation.
         centre = df[df.kind == "centre"]
         if len(centre) >= 2:
             sigma_pure = float(centre[metric].std(ddof=1))
@@ -490,6 +499,234 @@ def report_proposal(prop, df, metric):
     print("  ~2.4 sigma, while a fit uses all 16 runs to estimate each effect.")
 
 
+def confirm_runs(root=".", arm="P4", n_cells=2, n_seeds=3, verbose=True):
+    """Run the cells the model PREDICTS are best, and check the prediction.
+
+    This is not a victory lap, it is the design's only falsification test.
+
+    A 2^(5-1) fraction spends 16 runs estimating 16 parameters (intercept, 5
+    main effects, 10 two-factor interactions), so the fitted model reproduces
+    all 16 observed corners **exactly** and has **zero residual degrees of
+    freedom**. Nothing inside the experiment can contradict it. Its predictions
+    for the 16 cells of the complementary fraction -- which is where BOTH
+    metrics put their top-ranked cell -- rest entirely on the assumption that
+    every three-, four- and five-factor interaction is zero. Under the generator
+    I = ABCDE each two-factor interaction is aliased with a three-factor one
+    (AB with CDE, and so on), so that assumption is doing real work here and is
+    untestable from inside the design.
+
+    The only way to test it is to run a cell in the other half and see whether
+    the prediction lands. The prediction is therefore written to the ledger
+    BEFORE the runs start: with it on disk first, a miss cannot be
+    reinterpreted afterwards as something we expected all along.
+
+    Replicated, because one run cannot separate "the model extrapolates badly"
+    from "this draw was unlucky". sigma is 0.0063 (E18) and the AUROC
+    prediction sits +0.018 above the best observed run -- under 3 sigma of a
+    single run. Three seeds put the SE of the cell mean near 0.0036 and make
+    the comparison interpretable in either direction.
+
+    A miss is worth as much as a hit: it would mean `propose_config`
+    extrapolates on an assumption these data cannot support, and that the
+    design's trustworthy output is its effects, not its config recommendation.
+    """
+    from .data.examples import ExampleConfig
+    from .data.sequences import SeqConfig
+    from .train_finetune import TrainConfig, train
+
+    basin = _read_ledger("lr_basin")
+    if basin is None:
+        raise SystemExit("no lr_basin in the ledger")
+    basin_lr = float(basin["basin_lr"])
+    lo_hi = dict(FACTORS)
+    lo_hi["lr"] = (basin_lr / 3, basin_lr * 3)
+
+    df = pd.read_csv("outputs/design_runs.csv")
+    props = {m: propose_config(df, m) for m in ("macro_ap", "macro_auroc")}
+
+    # Cells are chosen by macro AP -- the PRE-REGISTERED primary (W2). AUROC
+    # rides along as the co-secondary and does not get a vote in the choice.
+    cells = props["macro_ap"].head(n_cells)
+    coded = list(FACTORS)
+
+    preg = []
+    for rank, (_, c) in enumerate(cells.iterrows(), start=1):
+        key = tuple(int(c[f]) for f in coded)
+        pa = props["macro_auroc"]
+        m = np.ones(len(pa), bool)
+        for f, v in zip(coded, key):
+            m &= (pa[f].to_numpy() == v)
+        preg.append({"rank": rank, "cell": dict(zip(coded, key)),
+                     "was_run": bool(c["was_run"]),
+                     "pred_macro_ap": float(c["predicted"]),
+                     "pred_macro_auroc": float(pa.loc[m, "predicted"].iloc[0])})
+
+    LEDGER.parent.mkdir(exist_ok=True)
+    with LEDGER.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"event": "confirm_prereg", "n_seeds": n_seeds,
+                             "cells": preg}) + chr(10))
+    print("PRE-REGISTERED, on disk before any run starts:", flush=True)
+    for q in preg:
+        print("  rank %d  %s" % (q["rank"], q["cell"]), flush=True)
+        print("          predicts AP %.4f / AUROC %.4f   (was_run=%s)"
+              % (q["pred_macro_ap"], q["pred_macro_auroc"], q["was_run"]),
+              flush=True)
+
+    # RESUME. The first attempt died of memory exhaustion at run 3 of 6 (D20,
+    # violated by running a second job beside it), and `rows` starting empty
+    # would have rewritten design_confirm.csv with only the new runs --
+    # destroying the two survivors that the per-run write had just saved. The
+    # per-run write protects against losing a crash's completed work only if
+    # the restart reads it back.
+    #
+    # Keyed on (rank, seed), which is what identifies a cell-replicate. Seeds
+    # are deterministic in rank and index, so a resumed run reproduces exactly
+    # the set the original would have produced -- no reshuffling that would
+    # quietly change which replicates the mean is over.
+    rows = []
+    done = set()
+    prev = Path("outputs/design_confirm.csv")
+    if prev.exists():
+        old_df = pd.read_csv(prev)
+        # Only rows whose pre-registered prediction still matches are kept. If
+        # the proposal moved, the old runs answer a question that is no longer
+        # being asked and silently averaging them in would be wrong.
+        pred_by_rank = {q["rank"]: q["pred_macro_ap"] for q in preg}
+        for _, r in old_df.iterrows():
+            want = pred_by_rank.get(int(r["rank"]))
+            if want is not None and abs(float(r["pred_macro_ap"]) - want) < 1e-9:
+                rows.append(r.to_dict())
+                done.add((int(r["rank"]), int(r["seed"])))
+        stale = len(old_df) - len(rows)
+        print("  resuming: %d completed runs reused%s"
+              % (len(rows), ", %d dropped as stale" % stale if stale else ""),
+              flush=True)
+
+    for q in preg:
+        pick = {f: lo_hi[f][0] if q["cell"][f] < 0 else lo_hi[f][1]
+                for f in coded}
+        n_layer, n_embd, n_head = pick.pop("capacity")
+        for si in range(n_seeds):
+            # Seeds start at 100. The design used 0-19 and the resume
+            # fingerprint includes the seed, so a collision would silently
+            # continue a design run's checkpoint -- that is D26 exactly.
+            seed = 100 + q["rank"] * 10 + si
+            if (q["rank"], seed) in done:
+                continue
+            t = time.time()
+            cfg = TrainConfig(seed=seed, dev_frac=0.0, holdout_frac=0.0,
+                              epochs=30, patience=4, min_delta=0.002,
+                              n_layer=n_layer, n_embd=n_embd, n_head=n_head,
+                              lr=pick["lr"], weight_decay=pick["weight_decay"],
+                              attn_dropout=pick["dropout"],
+                              resid_dropout=pick["dropout"],
+                              fusion=pick["fusion"])
+            res = train(arm, root, cfg, ExampleConfig(), SeqConfig(),
+                        verbose=False)
+            row = {"rank": q["rank"], "seed": seed, "kind": "confirm",
+                   "n_layer": n_layer, "n_embd": n_embd, "n_head": n_head,
+                   **pick,
+                   **{"c_" + f: q["cell"][f] for f in coded},
+                   "pred_macro_ap": q["pred_macro_ap"],
+                   "pred_macro_auroc": q["pred_macro_auroc"],
+                   "macro_auroc": res["macro_auroc"],
+                   "macro_ap": res["macro_ap"], "epoch": res["epoch"],
+                   "minutes": (time.time() - t) / 60}
+            if res.get("preds") is not None:
+                Path("artifacts").mkdir(exist_ok=True)
+                np.save("artifacts/confirm_preds_r%ds%d.npy"
+                        % (q["rank"], seed), res["preds"])
+            rows.append(row)
+            if verbose:
+                print("  rank %d seed %d  AUROC %.4f  AP %.4f  [%.1f min]"
+                      % (q["rank"], seed, row["macro_auroc"], row["macro_ap"],
+                         row["minutes"]), flush=True)
+            pd.DataFrame(rows).to_csv("outputs/design_confirm.csv", index=False)
+            with LEDGER.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(dict({"event": "confirm_run"}, **row)) + chr(10))
+    return pd.DataFrame(rows)
+
+
+def _pred_sigma(df, metric):
+    """SE of a saturated design's prediction at ANY cell -- which is sigma.
+
+    Worth deriving rather than assuming, because the answer is surprising and
+    it decides whether a miss is real.
+
+    With +-1 coding the 16 corner columns are orthogonal, so X'X = 16*I and
+    Var(beta_j) = sigma^2 / 16 for each of the 16 coefficients (intercept, 5
+    main effects, 10 two-factor interactions). A prediction is
+    pred = sum_j g_j * beta_j with every g_j = +-1, and the coefficients are
+    uncorrelated, so
+
+        Var(pred) = sum_j g_j^2 * sigma^2/16 = 16 * sigma^2/16 = sigma^2.
+
+    The fitted model's prediction is therefore **exactly as noisy as one run**.
+    That is the price of saturation: 16 runs spent on 16 parameters buys
+    hidden replication for each individual EFFECT (SE = 2*sigma/sqrt(16) =
+    sigma/2) but none at all for a whole-cell prediction, because every
+    coefficient's error is summed back in.
+
+    Consequence for the comparison: the SE of (observed mean over R seeds minus
+    prediction) is sqrt(sigma^2/R + sigma^2), never s/sqrt(R). At R = 3 that is
+    1.15*sigma against 0.58*sigma -- a factor of two, and exactly the factor
+    that would turn a 2-sigma "the proposal failed" into a 1-sigma "consistent".
+
+    Shrinkage reduces the variance of `pred` and adds bias in exchange, so
+    treating it as unshrunken overstates this SE slightly. That is the
+    conservative direction and it is taken deliberately: the alternative
+    understates the uncertainty of a claim that the method does not work.
+    """
+    centre = df[df.kind == "centre"]
+    s_centre = float(centre[metric].std(ddof=1)) if len(centre) >= 2 else None
+    # Centre-only, for the reason given in analyse_design: the seed replicates
+    # scored on dev n=558 and these centre points on val n=365, so pooling them
+    # mixes two estimands. E24.6 / E27.
+    return s_centre if s_centre is not None else float("nan")
+
+
+def report_confirm(cf, df):
+    """Did the predicted cells deliver? Judged against the pre-registered value."""
+    print(chr(10) + "=== CONFIRMATION of the predicted-best cells ===")
+    for m in ("macro_ap", "macro_auroc"):
+        print(chr(10) + "  " + m)
+        best_obs = float(df[df.kind == "corner"][m].max())
+        sig = _pred_sigma(df, m)
+        corner_mean = float(df[df.kind == "corner"][m].mean())
+        print("    sigma = %.4f, so SE(prediction) = %.4f -- see _pred_sigma:"
+              " a saturated" % (sig, sig))
+        print("    design predicts a CELL no more precisely than a single run"
+              " measures one.")
+        for rank, g in cf.groupby("rank"):
+            obs = g[m].to_numpy(float)
+            pred = float(g["pred_" + m].iloc[0])
+            mean = float(obs.mean())
+            R = len(obs)
+            s_obs = float(obs.std(ddof=1)) if R > 1 else float("nan")
+            # Both terms, not just the seeds' scatter: the thing being compared
+            # against is itself an estimate with SE = sigma.
+            se = float(np.sqrt(sig ** 2 / R + sig ** 2))
+            d = mean - pred
+            z = d / se if se > 0 else float("nan")
+            print("    rank %d  n=%d  observed %.4f (seed sd %.4f)   predicted"
+                  " %.4f" % (rank, R, mean, 0.0 if s_obs != s_obs else s_obs,
+                             pred))
+            print("            error %+.4f +- %.4f  (%+.1f SE)  %s"
+                  % (d, se, z, "MISS" if abs(z) >= 2 else "consistent"))
+            print("            vs best corner OBSERVED %+.4f   vs corner mean"
+                  " %+.4f" % (mean - best_obs, mean - corner_mean))
+        print("    A negative error beyond 2 SE means `propose_config`"
+              " extrapolated on effect")
+        print("    heredity and heredity did not hold -- a finding about the"
+              " METHOD, reported")
+        print("    either way. 'vs corner mean' is the weaker but more robust"
+              " question:")
+        print("    whether the proposed cell beats the average of what was"
+              " actually run,")
+        print("    which does not depend on the point prediction being right"
+              " at all.")
+
+
 def analyse_design(df, metric="macro_ap"):
     """Main effects from the corners; pure error and curvature from the centre."""
     from .effects import orthogonal_effects, report_orthogonal
@@ -503,10 +740,54 @@ def analyse_design(df, metric="macro_ap"):
     # twin matching on everything else and pairing returns nothing at all. Found
     # by testing the analysis on synthetic runs before spending 5 CPU-hours.
     s_pure = float(centre[metric].std(ddof=1)) if len(centre) >= 2 else None
+    n_pure = len(centre)
+
+    # POOL the centre-point estimate with the seed replicates measured before
+    # the design ran. Both estimate the same thing -- total run-to-run sigma at
+    # a fixed configuration -- and each on its own is badly under-powered:
+    # 4 centre points give 3 df and 5 seed runs give 4, and a variance estimate
+    # on 3 df has a 95% interval spanning roughly 0.6x to 2.9x of the truth.
+    #
+    # That instability is visible in the numbers. On AP the centre estimate is
+    # the LARGER of the two (0.0112 vs 0.0080); on AUROC it is the SMALLER
+    # (0.0045 vs 0.0063). Two estimates of one quantity disagreeing in opposite
+    # directions on two metrics is the signature of noise, not of a real
+    # difference between the two configurations.
+    #
+    # So the pooling is tested rather than assumed: an F-test for equal
+    # variances, and pooling only if it does not reject. If it does reject, the
+    # two are measuring different things and the LARGER is used, which is the
+    # same "use the larger" convention `effects.report` already applies to
+    # se_fold vs se_config. Never silently take the smaller -- that is the one
+    # choice that manufactures significance.
+    # NOT POOLED with the seed-replicate sigma, and that is a reversal.
+    #
+    # An earlier version pooled the centre points with `seed_sigma` from the
+    # ledger, gated on an F-test. It was wrong: `design_seeds.csv` carries
+    # populated hold_auroc columns, which only exist when holdout_frac > 0, so
+    # the seed runs scored on **dev n=558** while these centre points score on
+    # **val n=365**. Two different evaluation sets estimate two different
+    # quantities and pooling them was never licensed. For AP it moved sigma
+    # 0.0112 -> 0.0095, narrowing fusion's interval in the ANTI-conservative
+    # direction.
+    #
+    # The F-test that licensed it could not have caught this either: at 3 and 4
+    # degrees of freedom it only rejects beyond a 3.2x ratio of sigmas, so
+    # "p = 0.53, no evidence they differ" was a statement about its own power.
+    #
+    # Centre-only is the honest estimator here: it is measured on the same
+    # evaluation set, at a configuration inside the design, on 3 df. Wide, and
+    # correct. See E24.6 and E27.
+    if s_pure is not None:
+        print("\n  pure error from %d centre replicates (val n=365): sigma = %.4f"
+              % (n_pure, s_pure))
+        print("    NOT pooled with seed_sigma -- that was measured on dev n=558,"
+              " a different")
+        print("    evaluation set. See E24.6 / E27.")
 
     coded = ["c_" + f for f in FACTORS]
     eff = orthogonal_effects(corners, coded, metric,
-                             sigma_pure=s_pure, n_pure=len(centre))
+                             sigma_pure=s_pure, n_pure=n_pure)
     if not eff.empty:
         eff["factor"] = eff.factor.str.replace("c_", "", regex=False)
     report_orthogonal(eff, metric + " (design corners)")
@@ -515,10 +796,16 @@ def analyse_design(df, metric="macro_ap"):
     if len(centre) >= 2:
         # Pure error, estimated INSIDE the experiment rather than assumed
         # (computed above, since the effect intervals depend on it).
-        print("\n  pure error from %d centre replicates: sigma = %.4f"
-              % (len(centre), s_pure))
+        print("  sigma used for the effect intervals: %.4f on %d df"
+              % (s_pure, n_pure - 1))
+        # Curvature uses the CENTRE-ONLY sigma on purpose. It is a statement
+        # about where the centre points sit relative to the corners, so the
+        # relevant scatter is the scatter of those centre points; borrowing a
+        # variance measured at a different configuration would be assuming part
+        # of what the test is meant to check.
+        s_centre = float(centre[metric].std(ddof=1))
         d = float(corners[metric].mean() - centre[metric].mean())
-        se = s_pure * np.sqrt(1.0 / len(corners) + 1.0 / len(centre))
+        se = s_centre * np.sqrt(1.0 / len(corners) + 1.0 / len(centre))
         z = d / se if se > 0 else float("nan")
         print("  curvature (corners - centre): %+.4f (%+.1f sigma of pure error)"
               % (d, z))
@@ -544,6 +831,10 @@ def main() -> None:
                     help="run the full design (needs --lr-basin first)")
     ap.add_argument("--analyse", action="store_true",
                     help="re-analyse outputs/design_runs.csv, no re-run")
+    ap.add_argument("--confirm", action="store_true",
+                    help="run the PREDICTED-best cells and test the prediction")
+    ap.add_argument("--cells", type=int, default=2)
+    ap.add_argument("--seeds-per-cell", type=int, default=3)
     a = ap.parse_args()
 
     if a.show_design:
@@ -552,6 +843,11 @@ def main() -> None:
         print(pd.DataFrame(d, columns=list(FACTORS)).to_string())
         print("\n  verified: all 5 main effects and all 10 two-factor "
               "interactions mutually orthogonal")
+        return
+
+    if a.confirm:
+        cf = confirm_runs(".", n_cells=a.cells, n_seeds=a.seeds_per_cell)
+        report_confirm(cf, pd.read_csv("outputs/design_runs.csv"))
         return
 
     if a.analyse:
@@ -569,7 +865,7 @@ def main() -> None:
         return
 
     if a.lr_basin:
-        print("locating the learning-rate basin (2L/d128, dev_frac=0.2) ...", flush=True)
+        print("locating the learning-rate basin (2L/d128, fusion=none, scored on provided val) ...", flush=True)
         out = lr_basin(".")
         LEDGER.parent.mkdir(exist_ok=True)
         with LEDGER.open("a", encoding="utf-8") as fh:
@@ -577,7 +873,7 @@ def main() -> None:
         return
 
     if a.seeds:
-        print(f"measuring sigma over {a.seeds} seeds (2L/d128, dev_frac=0.2) ...",
+        print(f"measuring sigma over {a.seeds} seeds (2L/d128, fusion=none, same protocol as the design) ...",
               flush=True)
         out = seed_sigma(".", a.seeds)
         report_sigma(out)

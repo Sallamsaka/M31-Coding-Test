@@ -66,6 +66,24 @@ class TrainConfig:
     # encoder does nothing" for entirely the wrong reason (D26/D34/D36).
     corrupt_seq: bool = False
 
+    trunk_lr_mult: float = 1.0
+    """Multiply the SEQUENCE TRUNK's learning rate by this; 1.0 is inert.
+
+    E54 measured a frozen pretrained trunk beating a frozen random one by
+    +0.0318 AUROC, while end-to-end pretraining was a null -- so the warm-up
+    learns something real and fine-tuning reaches the same place without it.
+    The remaining question is whether fine-tuning also *overwrites* it: 8-10
+    epochs at the full lr on a 1-layer/d64 trunk is a lot of updates.
+
+    A value below 1 slows the trunk relative to the head, which is layer-wise
+    LR decay in its simplest form -- the standard way to keep a pretrained
+    representation while still fitting a fresh classifier on top. 0.0 freezes
+    the trunk outright.
+
+    Trunk = tok/time/dt_bias/mix/blocks/ln_f. Head = head/feat_proj, which are
+    randomly initialised either way and must NOT be slowed down.
+    """
+
     min_delta: float = 0.0
     """How much dev AP must IMPROVE to count as an improvement.
 
@@ -487,6 +505,8 @@ def _config_fingerprint(cfg: "TrainConfig", arm: str, vocab_size: int,
     # say "the encoder does nothing" for the wrong reason. D26/D34/D36.
     if getattr(cfg, "corrupt_seq", False):
         blob += "|corrupt_seq=1"
+    if getattr(cfg, "trunk_lr_mult", 1.0) != 1.0:
+        blob += f"|trunklr={cfg.trunk_lr_mult}"
     # The pretraining objective and budget change what the weights become, so
     # they identify the checkpoint. Without this, P1 at 8 pretraining epochs and
     # P1 at 4 share a slot and a run id -- and a resumed run would load the
@@ -731,12 +751,26 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
         modality_dropout=cfg.modality_dropout,
         n_features=(feats.shape[1] if feats is not None else 0)))
 
-    decay = [p for n, p in model.named_parameters() if p.dim() >= 2]
-    nodecay = [p for n, p in model.named_parameters() if p.dim() < 2]
-    opt = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": cfg.weight_decay},
-         {"params": nodecay, "weight_decay": 0.0}],
-        lr=cfg.lr, betas=(0.9, 0.95))
+    # Four groups: {decay, nodecay} x {trunk, head}. The weight-decay split is
+    # the usual one (dim >= 2 decays); the trunk/head split carries
+    # `trunk_lr_mult`, stored per group as `lr_scale` and applied by the
+    # schedule below so warmup and cosine still shape both.
+    _HEAD = ("head", "feat_proj")
+    _is_head = lambda n: n.split(".")[0] in _HEAD
+    groups = []
+    for tag, want_head in (("trunk", False), ("head", True)):
+        scale = 1.0 if want_head else cfg.trunk_lr_mult
+        for wd, want_decay in ((cfg.weight_decay, True), (0.0, False)):
+            ps = [q for n, q in model.named_parameters()
+                  if _is_head(n) == want_head and (q.dim() >= 2) == want_decay]
+            if ps:
+                groups.append({"params": ps, "weight_decay": wd,
+                               "lr_scale": scale, "name": f"{tag}_{'d' if want_decay else 'n'}"})
+    opt = torch.optim.AdamW(groups, lr=cfg.lr, betas=(0.9, 0.95))
+    if cfg.trunk_lr_mult != 1.0 and verbose:
+        _nt = sum(len(g["params"]) for g in groups if g["name"].startswith("trunk"))
+        print(f"  trunk lr x{cfg.trunk_lr_mult} ({_nt} tensors); head at full lr",
+              flush=True)
 
     rng = np.random.default_rng(cfg.seed)
     steps_per_epoch = math.ceil(len(tr) / cfg.batch_size)
@@ -814,7 +848,7 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
                            0.5 * (1 + math.cos(math.pi * (step - warm) /
                                                max(1, total - warm))))
             for g in opt.param_groups:
-                g["lr"] = lr
+                g["lr"] = (lr) * g.get("lr_scale", 1.0)
 
             t, d, L = _trim(pack.tokens, pack.dt, pack.lengths, rows)
             fb = torch.from_numpy(feats[rows]) if feats is not None else None

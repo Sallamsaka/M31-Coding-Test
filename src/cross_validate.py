@@ -103,7 +103,7 @@ TRANSFORMER_CFG = dict(n_layer=1, n_embd=64, n_head=2, lr=0.0012,
 TRANSFORMER_SEEDS = (300, 301, 302)
 
 
-def _fit_transformer(root, fit_rows, ex_cfg, y_shape):
+def _fit_transformer(root, fit_rows, ex_cfg, y_shape, verbose=False):
     """Train on this fold's patients and return full-cohort probabilities.
 
     Seed-averaged over three runs in logit space. That is not a refinement: on
@@ -131,7 +131,7 @@ def _fit_transformer(root, fit_rows, ex_cfg, y_shape):
                           patience=4, min_delta=0.002, predict_all=True,
                           **TRANSFORMER_CFG)
         res = train("P4", root, cfg, ex_cfg or _EC(), SeqConfig(),
-                    verbose=False, fold_pids=fold_pids)
+                    verbose=verbose, fold_pids=fold_pids)
         P = res.get("all_preds")
         if P is None:
             raise RuntimeError("predict_all returned nothing")

@@ -898,6 +898,14 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
             Pm = np.where(ar[va].astype(bool), P, 1e-6)
             au, _ = macro_auroc(y[va].astype(int), Pm)
             apv, _ = macro_ap(y[va].astype(int), Pm)
+            # The training objective, evaluated on the eval set: the same
+            # at-risk-masked BCE, so "loss" and "val_loss" are one quantity on
+            # two populations. Logged only -- selection stays on AP.
+            _m = ar[va].astype(np.float64)
+            _p = np.clip(P.astype(np.float64), 1e-7, 1 - 1e-7)
+            _yv = y[va].astype(np.float64)
+            val_loss = float((-(_yv * np.log(_p) + (1 - _yv) * np.log1p(-_p))
+                              * _m).sum() / max(_m.sum(), 1.0))
             # Score the averaged weights on the SAME eval set, then restore.
             # One extra forward pass per epoch; selection is untouched.
             ema_au = ema_ap = float("nan")
@@ -926,7 +934,8 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
             # recoverable after the fact, so both are logged per epoch.
             pnorm = float(sum(float(q.detach().norm()) ** 2
                               for q in model.parameters()) ** 0.5)
-            run.log({"loss": tot / max(nb, 1), "macro_auroc": au,
+            run.log({"loss": tot / max(nb, 1), "val_loss": val_loss,
+                     "macro_auroc": au,
                      "macro_ap": apv, "lr": lr,
                      "epoch": epoch + 1,
                      "grad_norm_mean": gn_sum / max(nb, 1),

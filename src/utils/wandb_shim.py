@@ -114,6 +114,19 @@ class Run:
                 pass
 
 
+def _has_netrc() -> bool:
+    """Whether `wandb login` has left a credential file behind.
+
+    Checking only ``~/.netrc`` was wrong on Windows, where wandb writes
+    ``~/_netrc``: a logged-in machine was forced into offline mode, and every
+    run landed in ``wandb/offline-run-*`` with no URL. wandb itself reads
+    ``$NETRC``, then ``~/.netrc``, then ``~/_netrc``.
+    """
+    cands = [os.environ.get("NETRC", ""),
+             Path.home() / ".netrc", Path.home() / "_netrc"]
+    return any(c and Path(c).exists() for c in cands)
+
+
 def init(name: str, config: dict[str, Any] | None = None,
          project: str = "m31-patient-timeline") -> Run:
     """Local recorder always; the wandb backend only when asked for.
@@ -137,8 +150,7 @@ def init(name: str, config: dict[str, Any] | None = None,
     if want:
         try:
             import wandb                                   # noqa: PLC0415
-            if not (os.environ.get("WANDB_API_KEY")
-                    or (Path.home() / ".netrc").exists()):
+            if not (os.environ.get("WANDB_API_KEY") or _has_netrc()):
                 os.environ.setdefault("WANDB_MODE", "offline")
             backend = wandb.init(project=project, name=name, config=config,
                                  reinit=True)

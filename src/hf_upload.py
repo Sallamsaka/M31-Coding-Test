@@ -87,7 +87,7 @@ wins here, that ranking should not be assumed to transfer.**
 ## Reproducing
 
 ```bash
-git clone <repo> && pip install -r requirements.txt
+git clone https://github.com/Sallamsaka/M31-Coding-Test && pip install -r requirements.txt
 ./run_all.ps1
 ```
 """
@@ -101,6 +101,55 @@ def build_card(model: str, metrics: dict) -> str:
     else:
         table = "_not yet computed_"
     return CARD.format(model=model, metrics=table)
+
+
+def _cached_token() -> str | None:
+    """The token from a prior `huggingface-cli login`, which the docstring
+    always promised to honour but the code never read."""
+    try:
+        from huggingface_hub import get_token        # noqa: PLC0415
+        return get_token()
+    except Exception:
+        return None
+
+
+def _shipped_transformer_ckpts(root: Path) -> list[Path]:
+    """The three seed checkpoints behind model_transformer.joblib.
+
+    model_transformer.joblib stores the transformer's OUTPUT matrix, not its
+    weights, so the weights must be shipped separately. They are identified by
+    recomputing the config fingerprint the shipped fit used (TRANSFORMER_CFG,
+    full train split, default ExampleConfig) -- not by modification time and
+    not by a hardcoded hash, either of which silently goes stale on a refit.
+    """
+    import hashlib                                   # noqa: PLC0415
+
+    import torch                                     # noqa: PLC0415
+
+    from .cross_validate import TRANSFORMER_CFG, TRANSFORMER_SEEDS
+    from .data.cohort import load_cohort
+    from .data.sequences import SeqConfig
+    from .train_finetune import TrainConfig, _config_fingerprint
+
+    c = load_cohort(root)
+    tr = sorted(set(c.loc[c.split == "train", "pid"].tolist()))
+    fk = hashlib.sha256(",".join(map(str, tr)).encode()).hexdigest()[:12]
+    out = []
+    for sd in TRANSFORMER_SEEDS:
+        cfg = TrainConfig(seed=sd, dev_frac=0.0, holdout_frac=0.0, epochs=30,
+                          patience=4, min_delta=0.002, predict_all=True,
+                          **TRANSFORMER_CFG)
+        hits = []
+        for p in sorted((root / "artifacts").glob(f"model_P4_seed{sd}_*.pt")):
+            v = torch.load(p, map_location="cpu", weights_only=False)["vocab_size"]
+            fp = _config_fingerprint(cfg, "P4", v, SeqConfig().block_size, fk, "")
+            if p.stem.endswith(fp[:8]):
+                hits.append(p)
+        if len(hits) != 1:
+            raise FileNotFoundError(
+                f"expected one shipped checkpoint for seed {sd}, found {hits}")
+        out += hits
+    return out
 
 
 def upload(repo: str, root: Path | str = ".", dry_run: bool = False) -> None:
@@ -117,16 +166,25 @@ def upload(repo: str, root: Path | str = ".", dry_run: bool = False) -> None:
 
     files = [card]
     for rel in ("artifacts/vocab.json", "outputs/predictions.csv",
-                "outputs/per_code_val.csv", "outputs/predictions_meta.json"):
+                "outputs/per_code_val.csv", "outputs/predictions_meta.json",
+                "artifacts/submission_manifest.joblib",
+                "artifacts/platt_params.npz"):
         p = root / rel
         if p.exists():
             files.append(p)
-    # The model itself -- whichever form won. A card with no weights is not a
-    # model repository.
-    files += sorted((root / "artifacts").glob("model_*.joblib"))
-    files += sorted((root / "artifacts").glob("model_*.pt"))
+    # The model itself: exactly what the submission manifest names, and
+    # nothing else. This used to glob `model_*.pt`, which swept up ~90
+    # experiment checkpoints from every CV fold and ablation, while
+    # platt_params.npz -- without which the calibrated submission cannot be
+    # rebuilt -- was not uploaded at all.
+    components = meta.get("components", ["lr"])
+    files += [root / "artifacts" / f"model_{c}.joblib" for c in components
+              if (root / "artifacts" / f"model_{c}.joblib").exists()]
+    if "transformer" in components:
+        files += _shipped_transformer_ckpts(root)
 
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+             or _cached_token())
     if dry_run or not token:
         why = "dry run" if dry_run else "no HF_TOKEN in environment"
         print(f"[hf_upload] {why}; would upload {len(files)} file(s) to {repo}:")

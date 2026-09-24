@@ -71,6 +71,14 @@ class SeqConfig:
     min_patients_per_code: int = 5
     n_value_bins: int = 10
     fuse_min_events_per_bin: int = 50   # below this, fall back to a shared Q token
+    vocab_post_anchor: bool = False
+    """Count codes over training patients' WHOLE record, not only pre-anchor.
+
+    Needed only by full-timeline pretraining (§E56.5): a code that first appears
+    after the anchor is a next-event TARGET there, and would otherwise map to
+    [UNK_kind]. Lab level edges stay fitted on pre-anchor values, which is what
+    every model input sees. Off (default) reproduces the old vocabulary.
+    """
     text_answers: bool = False
     """Fuse a text-valued observation's answer into its token.
 
@@ -190,7 +198,11 @@ def build_vocab(root: Path | str = ".", cfg: SeqConfig | None = None,
                 & events.kind.isin(cfg.kinds)]
     assert len(ev) > 0 and ev.is_pre_anchor.all()
 
-    per_code = ev.groupby("token", observed=True).pid.nunique()
+    _code_ev = ev
+    if cfg.vocab_post_anchor:
+        # Training patients only (train_pids), any time: see SeqConfig.
+        _code_ev = events[events.pid.isin(train_pids) & events.kind.isin(cfg.kinds)]
+    per_code = _code_ev.groupby("token", observed=True).pid.nunique()
     keep = sorted(per_code[per_code >= cfg.min_patients_per_code].index)
 
     # Which numeric codes have the volume to support ten separate tokens?
@@ -261,13 +273,15 @@ def build_vocab(root: Path | str = ".", cfg: SeqConfig | None = None,
         "n_codes_kept": len(keep), "n_fused_codes": len(fused),
         "min_patients_per_code": cfg.min_patients_per_code,
         "adaptive_bins": cfg.adaptive_bins,
+        "vocab_post_anchor": cfg.vocab_post_anchor,
         "text_answers": cfg.text_answers, "n_text_pairs": len(text_pairs),
     })
 
 
 def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
                     cfg: SeqConfig | None = None,
-                    ex_cfg: ExampleConfig | None = None) -> SeqPack:
+                    ex_cfg: ExampleConfig | None = None,
+                    full_pids: set | None = None) -> SeqPack:
     """One sequence per **example**, truncated at that example's own cutoff.
 
     Built by slicing rather than re-filtering. Each patient's events are laid
@@ -282,7 +296,20 @@ def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
     cohort, events = load_cohort(root), load_events(root)
     ex = load_examples(root, ex_cfg)
 
-    pre = events[events.is_pre_anchor & events.kind.isin(cfg.kinds)].copy()
+    if full_pids is not None:
+        # FULL-TIMELINE pack, for pretraining only: one row per given patient,
+        # cut one day after their last event, so every event -- before and after
+        # the anchor -- is in view. The caller must pass TRAINING patients only;
+        # train() asserts it. Never used as a model input for prediction.
+        fp = sorted(int(p) for p in full_pids)
+        ev_f = events[events.pid.isin(fp)]
+        last = ev_f.groupby("pid", observed=True).ts_seq.max().reindex(fp)
+        ex = pd.DataFrame({"eid": np.arange(len(fp)), "pid": fp,
+                           "cutoff": (last + pd.Timedelta(days=1)).to_numpy(),
+                           "split": "train", "is_real": True})
+        pre = events[events.pid.isin(fp) & events.kind.isin(cfg.kinds)].copy()
+    else:
+        pre = events[events.is_pre_anchor & events.kind.isin(cfg.kinds)].copy()
 
     # Resolve each event to a token id, vectorised per group.
     tok = pre.token.astype(str).to_numpy()

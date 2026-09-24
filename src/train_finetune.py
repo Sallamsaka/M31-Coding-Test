@@ -157,6 +157,11 @@ class TrainConfig:
     """See GPTConfig.use_age_encoding. False is inert and is the default."""
     use_reason_embedding: bool = False
     """See GPTConfig.use_reason_embedding. False is inert and is the default."""
+    pretrain_corpus: str = "pre"
+    """``pre`` (default): warm up on the fit patients' pre-anchor sequences, as E53.
+    ``full``: ALSO on the same patients' whole timelines, before and after the
+    anchor -- 935k -> ~1.9M events (§E56.5). Training patients only; asserted.
+    Only read by arms that pretrain."""
 
     # --- capacity and regularisation, searchable ---------------------------
     n_layer: int = 4
@@ -391,6 +396,21 @@ def pretrain(model: PatientTransformer, pack, rows: np.ndarray, objective: str,
             break
 
 
+def _pretrain_pack(pack, rows: np.ndarray, full):
+    """Fit rows of the pre-anchor pack stacked with the full-timeline pack."""
+    from dataclasses import replace as _replace
+    cat = lambda a, b: (None if a is None or b is None
+                        else np.concatenate([a[rows], b]))
+    return _replace(pack,
+                    tokens=cat(pack.tokens, full.tokens), dt=cat(pack.dt, full.dt),
+                    lengths=cat(pack.lengths, full.lengths),
+                    eid=cat(pack.eid, full.eid), pid=cat(pack.pid, full.pid),
+                    split=cat(pack.split, full.split),
+                    is_real=cat(pack.is_real, full.is_real),
+                    age_days=cat(pack.age_days, full.age_days),
+                    reasons=cat(pack.reasons, full.reasons))
+
+
 def inner_split_pids(root: str | Path, dev_frac: float, holdout_frac: float,
                      seed: int = 12345) -> tuple[set[int], set[int]]:
     """``(dev_pids, hold_pids)`` carved out of TRAIN, as a pure function.
@@ -543,6 +563,8 @@ def _config_fingerprint(cfg: "TrainConfig", arm: str, vocab_size: int,
     _pre = ARMS.get(arm, {}).get("pretrain")
     if _pre is not None:
         blob += f"|pretrain={_pre}:{getattr(cfg, 'pretrain_epochs', 0)}"
+        if getattr(cfg, "pretrain_corpus", "pre") != "pre":
+            blob += f"|corpus={cfg.pretrain_corpus}"
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -842,6 +864,8 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
                repr(asdict(ex_cfg)).encode()).hexdigest()[:12])
     if getattr(seq_cfg, "text_answers", False):
         _ek = f"{_ek}|text"
+    if getattr(seq_cfg, "vocab_post_anchor", False):
+        _ek = f"{_ek}|vpost"
     if getattr(seq_cfg, "adaptive_bins", False):
         # A different vocabulary construction must never share a checkpoint slot
         # with the default one. vocab_size would usually differ, but "usually"
@@ -878,9 +902,26 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
     # had been interrupted. The checkpoint already contains post-pretraining
     # weights, so re-doing it is not just wasted, it is wrong.
     if spec["pretrain"] is not None and start_epoch == 0:
+        _ppack, _prows = pack, tr
+        if cfg.pretrain_corpus == "full":
+            _fit = set(np.unique(pack.pid[tr]).tolist())
+            _coh = load_cohort(root)
+            _held = set(_coh.loc[_coh.split != "train", "pid"].tolist())
+            # The one leak this path could introduce: a validation, test or
+            # held-out-fold patient's FUTURE in the pretraining corpus. `tr` is
+            # already restricted to fold_pids; this makes it impossible anyway.
+            assert _fit and not (_fit & _held), "full-timeline pretraining saw non-train patients"
+            if fold_pids is not None:
+                assert _fit <= set(fold_pids), "full-timeline pretraining left the fold"
+            _full = build_sequences(root, vocab, seq_cfg, ex_cfg, full_pids=_fit)
+            _ppack = _pretrain_pack(pack, tr, _full)
+            _prows = np.arange(len(_ppack.tokens))
+            print(f"  pretraining corpus: {len(tr):,} pre-anchor + {len(_fit):,} "
+                  f"full-timeline sequences, {int((_ppack.tokens != 0).sum()):,} "
+                  f"tokens", flush=True)
         # A smoke run must exercise the pretraining path, not sit in it: with
         # `max_steps` set we are checking the code runs, not training anything.
-        pretrain(model, pack, tr, spec["pretrain"], cfg, vocab,
+        pretrain(model, _ppack, _prows, spec["pretrain"], cfg, vocab,
                  epochs=cfg.pretrain_epochs, verbose=verbose,
                  max_steps=(5 if max_steps is not None else None))
     elif spec["pretrain"] is not None and verbose:

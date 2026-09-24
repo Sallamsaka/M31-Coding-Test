@@ -57,6 +57,14 @@ VARIANTS: dict[str, dict] = {
     # Two layers ON TOP OF the only 1-layer candidate (B1, age), compared against
     # B1 -- still one change. Built after B1-B5 were read, as pre-registered.
     "B7_age_2layer": {"use_dt_bias": False, "use_age_encoding": True, "n_layer": 2},
+    # Pretraining, on top of the confirmed best (B1). B9 is the idea: next-event
+    # warm-up on training patients' WHOLE timelines. B8 is its control: the same
+    # warm-up on pre-anchor sequences only (E53's corpus). Both fine-tune fully.
+    "B8_age_pretrain_pre":  {"use_dt_bias": False, "use_age_encoding": True,
+                             "arm": "P1"},
+    "B9_age_pretrain_full": {"use_dt_bias": False, "use_age_encoding": True,
+                             "arm": "P1", "pretrain_corpus": "full",
+                             "seq__vocab_post_anchor": True},
 }
 SEEDS = (300,)
 CACHE = Path("artifacts/cv_fold_cache")

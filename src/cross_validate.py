@@ -124,6 +124,7 @@ def _fit_transformer(root, fit_rows, ex_cfg, y_shape, verbose=False,
     # construction); everything else is a TrainConfig field.
     _over = dict(overrides or {})
     seq_over = {k[5:]: _over.pop(k) for k in list(_over) if k.startswith("seq__")}
+    arm = _over.pop("arm", "P4")      # "P1" = causal + next-event pretraining
     tx_cfg = dict(TRANSFORMER_CFG, **_over)
     import numpy as _np
 
@@ -141,7 +142,7 @@ def _fit_transformer(root, fit_rows, ex_cfg, y_shape, verbose=False,
         cfg = TrainConfig(seed=sd, dev_frac=0.0, holdout_frac=0.0, epochs=30,
                           patience=4, min_delta=0.002, predict_all=True,
                           **tx_cfg)
-        res = train("P4", root, cfg, ex_cfg or _EC(), SeqConfig(**seq_over),
+        res = train(arm, root, cfg, ex_cfg or _EC(), SeqConfig(**seq_over),
                     verbose=verbose, fold_pids=fold_pids)
         P = res.get("all_preds")
         if P is None:

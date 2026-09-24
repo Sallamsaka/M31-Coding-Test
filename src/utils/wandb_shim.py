@@ -64,6 +64,31 @@ def git_provenance() -> dict[str, Any]:
 _GIT = git_provenance()
 
 
+_WANDB_NAMES = {
+    "loss": "train/loss",
+    "val_loss": "val/loss",
+    "macro_auroc": "val/macro_auroc",
+    "macro_ap": "val/macro_ap",
+    "lr": "train/learning_rate",
+    "epoch": "epoch",
+}
+
+
+def _wandb_names(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Readable dashboard keys: train/ and val/ say which set a number is on.
+
+    `ema_*` (a moving average of the weights, scored for monitoring only and
+    never used to select or predict) is left out of the dashboard; everything
+    else not named above is an optimizer diagnostic and goes under diagnostics/.
+    """
+    out = {}
+    for k, v in metrics.items():
+        if k.startswith("ema_"):
+            continue
+        out[_WANDB_NAMES.get(k, f"diagnostics/{k}")] = v
+    return out
+
+
 class Run:
     """Thin wrapper. ``run.log(...)`` always writes locally, wandb if it can."""
 
@@ -92,7 +117,11 @@ class Run:
         self._emit({"step": step, **metrics})
         if self._wb is not None:
             try:
-                self._wb.log(metrics, step=step)
+                # Dashboard names only; the local JSONL keeps the raw keys that
+                # the figures and analyses read. The x-axis is the epoch, the
+                # unit early stopping works in, not the optimizer step.
+                wb_step = int(metrics["epoch"]) if "epoch" in metrics else step
+                self._wb.log(_wandb_names(metrics), step=wb_step)
             except Exception as exc:                      # never fatal
                 self._emit({"event": "wandb_log_failed", "error": repr(exc)})
                 self._wb = None

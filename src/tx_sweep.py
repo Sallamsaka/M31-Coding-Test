@@ -99,7 +99,9 @@ def run(variant: str, root: str = ".", overrides: dict | None = None,
         oof[idx], scored[idx] = Pm[idx], True
         print(f"[{variant}] fold {k}: AUROC {macro_auroc(y[idx], Pm[idx])[0]:.4f} "
               f"AP {macro_ap(y[idx], Pm[idx])[0]:.4f}  ({how})", flush=True)
-    out = Path(f"artifacts/tx_sweep_{variant}.npz")
+    # Extra seeds get their own file so they never overwrite the seed-300 arm.
+    tag = variant if tuple(seeds) == SEEDS else f"{variant}_s{'-'.join(map(str, seeds))}"
+    out = Path(f"artifacts/tx_sweep_{tag}.npz")
     np.savez_compressed(out, p=oof, scored=scored,
                         meta=json.dumps({"variant": variant, "overrides": over,
                                          "seeds": list(seeds), "sig": sig}))
@@ -107,6 +109,20 @@ def run(variant: str, root: str = ".", overrides: dict | None = None,
     print(f"[{variant}] OOF n={int(r.sum())}: AUROC {macro_auroc(y[r], oof[r])[0]:.4f} "
           f"AP {macro_ap(y[r], oof[r])[0]:.4f}  total {(time.time() - t0) / 60:.1f} min "
           f"-> {out}", flush=True)
+    return out
+
+
+def average(name: str, parts: list[str]) -> Path:
+    """Logit-mean several single-seed arms into one -- the shipped recipe's
+    seed combination, so a 3-seed confirmation compares like with like."""
+    arrs = [np.load(f"artifacts/tx_sweep_{p}.npz") for p in parts]
+    scored = np.logical_and.reduce([a["scored"] for a in arrs])
+    lg = lambda q: np.log(np.clip(q, 1e-6, 1 - 1e-6) / (1 - np.clip(q, 1e-6, 1 - 1e-6)))
+    m = np.mean([lg(a["p"]) for a in arrs], axis=0)
+    out = Path(f"artifacts/tx_sweep_{name}.npz")
+    np.savez_compressed(out, p=(1 / (1 + np.exp(-m))).astype(np.float32),
+                        scored=scored, meta=json.dumps({"average_of": parts}))
+    print(f"[{name}] logit-mean of {parts} -> {out}", flush=True)
     return out
 
 
@@ -128,7 +144,7 @@ def _blend_parts(root: str, y_shape):
     return lr, gb, have
 
 
-def compare(a: str, b: str, root: str = ".") -> dict:
+def compare(a: str, b: str, root: str = ".", n_boot: int = 1000) -> dict:
     lab = load_labels(root, ExampleConfig())
     y, ar = lab["y"].astype(int), at_risk_mask(lab)
     A, B = (np.load(f"artifacts/tx_sweep_{v}.npz") for v in (a, b))
@@ -143,7 +159,9 @@ def compare(a: str, b: str, root: str = ".") -> dict:
                   f"P(A>B)={d[f'p_a_gt_b_{m}']:.2f}  {res}", flush=True)
 
     print(f"{a} vs {b}", flush=True)
-    d = paired_bootstrap_delta(y[rows], A["p"][rows], B["p"][rows])
+    # 1,000 resamples: interval ends to ~±0.001 and P(A>B) to ~±0.015, at half
+    # the cost of the default 2,000 (which took ~15 CPU-min per pair here).
+    d = paired_bootstrap_delta(y[rows], A["p"][rows], B["p"][rows], n_boot=n_boot)
     _line(f"transformer, n={int(rows.sum())}", d)
     out["tx"] = d
 
@@ -153,7 +171,8 @@ def compare(a: str, b: str, root: str = ".") -> dict:
         lg = lambda p: np.log(np.clip(p, 1e-6, 1 - 1e-6) / (1 - np.clip(p, 1e-6, 1 - 1e-6)))
         blend = lambda t: apply_at_risk_mask(
             1 / (1 + np.exp(-(lg(lr) + lg(gb) + lg(t)) / 3)), ar)
-        db = paired_bootstrap_delta(y[br], blend(A["p"])[br], blend(B["p"])[br])
+        db = paired_bootstrap_delta(y[br], blend(A["p"])[br], blend(B["p"])[br],
+                                    n_boot=n_boot)
         _line(f"LR+GBDT+TX blend, n={int(br.sum())}", db)
         out["blend"] = db
 
@@ -163,6 +182,17 @@ def compare(a: str, b: str, root: str = ".") -> dict:
     print(f"  pre-registered rule: {'CANDIDATE' if cand else 'not a candidate'}",
           flush=True)
     out["candidate"] = bool(cand)
+    # Persist: the terminal is not a record.
+    with open("outputs/tx_sweep_compare.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"a": a, "b": b, "n_boot": n_boot,
+                            "n_tx": int(rows.sum()), "n_blend": int(br.sum()),
+                            **{f"{k}_{m}": [float(x) for x in v[f"d_macro_{m}"]]
+                               for k, v in out.items() if isinstance(v, dict)
+                               for m in ("ap", "auroc")},
+                            **{f"{k}_p_{m}": float(v[f"p_a_gt_b_{m}"])
+                               for k, v in out.items() if isinstance(v, dict)
+                               for m in ("ap", "auroc")},
+                            "candidate": out["candidate"]}) + "\n")
     return out
 
 
@@ -172,11 +202,20 @@ def main() -> None:
     ap.add_argument("--overrides", default=None,
                     help="JSON overrides replacing the variant's (for combined arms)")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
+    ap.add_argument("--n-boot", type=int, default=1000,
+                    help="bootstrap resamples; 300 is enough to screen while a "
+                         "training job shares the CPU (P(A>B) to ~±0.025)")
+    ap.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
+    ap.add_argument("--average", nargs="+", metavar=("NAME", "PART"),
+                    help="NAME PART1 PART2 ...: logit-mean single-seed arms")
     a = ap.parse_args()
-    if a.compare:
-        compare(*a.compare)
+    if a.average:
+        average(a.average[0], a.average[1:])
+    elif a.compare:
+        compare(*a.compare, n_boot=a.n_boot)
     elif a.variant:
-        run(a.variant, overrides=json.loads(a.overrides) if a.overrides else None)
+        run(a.variant, overrides=json.loads(a.overrides) if a.overrides else None,
+            seeds=tuple(a.seeds))
     else:
         ap.error("give --variant or --compare")
 

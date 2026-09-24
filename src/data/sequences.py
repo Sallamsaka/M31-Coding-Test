@@ -104,6 +104,9 @@ class SeqPack:
     pid: np.ndarray         # NOT unique once augmented -- group by this for CV
     split: np.ndarray
     is_real: np.ndarray
+    # Age at this example's cutoff, in days. One number per example: the model
+    # derives age at every event as `age_days - dt`, so no sequence changes.
+    age_days: np.ndarray | None = None
 
     def __repr__(self) -> str:  # pragma: no cover
         return (f"SeqPack(tokens={self.tokens.shape}, "
@@ -271,6 +274,7 @@ def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
     T = np.zeros((n, L), np.int32)
     D = np.zeros((n, L), np.float32)
     lens = np.zeros(n, np.int32)
+    age = np.zeros(n, np.float32)
 
     demo_cols = [("gender", "SEX"), ("race", "RACE"),
                  ("ethnicity", "ETH"), ("marital", "MARITAL")]
@@ -295,6 +299,7 @@ def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
         body_d = ((cut - flat_ts[lo:stop]) / np.timedelta64(1, "s") / 86400.0)
 
         k = len(head) + len(body_t) + 1
+        age[row.eid] = (cut - np.datetime64(d["birthdate"])) / np.timedelta64(1, "D")
         T[row.eid, :len(head)] = head
         T[row.eid, len(head):k - 1] = body_t
         T[row.eid, k - 1] = anchor_tok
@@ -307,4 +312,4 @@ def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
     return SeqPack(tokens=T, dt=D, lengths=lens,
                    eid=ex.eid.to_numpy(), pid=ex.pid.to_numpy(),
                    split=ex.split.to_numpy().astype("U5"),
-                   is_real=ex.is_real.to_numpy())
+                   is_real=ex.is_real.to_numpy(), age_days=age)

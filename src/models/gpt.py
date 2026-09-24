@@ -122,6 +122,23 @@ class GPTConfig:
     *graded* notion of temporal distance is removed.
     """
 
+    use_age_encoding: bool = False
+    """Add a second Time2Vec per event, of the patient's AGE at that event.
+
+    The token stream carries sex, race, ethnicity and marital status but no
+    birth date, and ``dt`` counts days before the anchor, so nothing in the
+    sequence says how old the patient was when anything happened (§E56.3).
+    Age reached the model only through ``age_z`` in the fused feature vector,
+    once, at the readout. Delphi-2M -- the model this one is shaped after --
+    encodes age rather than time-to-anchor.
+
+    Computed, not stored: ``age_at_event = age_at_cutoff - dt``, so the caller
+    passes one number per example (``age0``, days) and no sequence changes.
+    Same width as the dt encoding, concatenated into ``mix`` -- no extra
+    positions, so ``block_size`` is unaffected. False reproduces the previous
+    model exactly: no parameters are created and ``mix`` keeps its width.
+    """
+
     causal: bool = True
     """Causal (each position sees only the past) or bidirectional.
 
@@ -166,9 +183,15 @@ class TimeEncoding(nn.Module):
     Cost: ``2 * d_time`` learnable numbers -- 128 at d_time=64.
     """
 
-    def __init__(self, d_time: int):
+    def __init__(self, d_time: int, scale: str = "log1p"):
         super().__init__()
         assert d_time >= 2
+        # "log1p" for time-before-anchor (spans 4.5 orders of magnitude);
+        # "decades" for age, which is roughly uniform over 0-110 years and
+        # where 60 vs 61 should not be squeezed together the way log1p would.
+        # Both put u in about [0, 11], so the frequency band below fits both.
+        assert scale in ("log1p", "decades")
+        self.scale = scale
         # Spread initial frequencies over the log-day range so some components
         # resolve days and others resolve decades.
         # Band chosen so every component is periodic over the OBSERVED range of
@@ -197,7 +220,9 @@ class TimeEncoding(nn.Module):
         self.a0 = nn.Parameter(torch.tensor(-1.0))
 
     def forward(self, dt_days: torch.Tensor) -> torch.Tensor:
-        u = torch.log1p(dt_days.clamp(min=0.0)).unsqueeze(-1)   # (B,T,1)
+        d = dt_days.clamp(min=0.0)
+        u = (torch.log1p(d) if self.scale == "log1p"
+             else d / 3652.5).unsqueeze(-1)                     # (B,T,1)
         periodic = torch.sin(u * self.w + self.a)               # (B,T,d-1)
         linear = self.w0 * u + self.a0                          # (B,T,1)
         return torch.cat([linear, periodic], dim=-1)
@@ -245,8 +270,11 @@ class PatientTransformer(nn.Module):
         self.cfg = cfg
         self.tok = nn.Embedding(cfg.vocab_size, cfg.n_embd, padding_idx=0)
         self.time = TimeEncoding(cfg.d_time)
+        self.age = (TimeEncoding(cfg.d_time, scale="decades")
+                    if cfg.use_age_encoding else None)
         # Concatenate-then-project. See module docstring for why not summing.
-        self.mix = nn.Linear(cfg.n_embd + cfg.d_time, cfg.n_embd, bias=False)
+        n_in = cfg.n_embd + cfg.d_time * (2 if cfg.use_age_encoding else 1)
+        self.mix = nn.Linear(n_in, cfg.n_embd, bias=False)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.ln_f = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.n_outputs)
@@ -344,12 +372,19 @@ class PatientTransformer(nn.Module):
 
     def encode(self, tokens: torch.Tensor, dt: torch.Tensor,
                strict: bool = False, causal: bool | None = None,
-               inject: tuple[int, torch.Tensor] | None = None) -> torch.Tensor:
+               inject: tuple[int, torch.Tensor] | None = None,
+               age0: torch.Tensor | None = None) -> torch.Tensor:
         pad = tokens != 0
         t = self.time(dt)
         if not self.cfg.use_time_encoding:
             t = torch.zeros_like(t)     # keep shapes and parameter count fixed
-        x = self.mix(torch.cat([self.tok(tokens), t], dim=-1))
+        parts = [self.tok(tokens), t]
+        if self.age is not None:
+            # Refuse rather than default: a silently-zero age would train a
+            # model that "has" age encoding and never sees one.
+            assert age0 is not None, "use_age_encoding=True needs age0 (days at cutoff)"
+            parts.append(self.age(age0.to(dt.dtype).unsqueeze(1) - dt))
+        x = self.mix(torch.cat(parts, dim=-1))
         if inject is not None:                # replace a position's embedding
             pos, vec = inject
             x = torch.cat([vec, x[:, pos + 1:]], dim=1) if pos == 0 else x
@@ -360,7 +395,8 @@ class PatientTransformer(nn.Module):
 
     def forward(self, tokens: torch.Tensor, dt: torch.Tensor,
                 lengths: torch.Tensor,
-                features: torch.Tensor | None = None) -> torch.Tensor:
+                features: torch.Tensor | None = None,
+                age0: torch.Tensor | None = None) -> torch.Tensor:
         """Logits per example, from whichever readout the mask implies."""
         # Applied once, HERE, rather than inside each fusion branch: both
         # `readout` and `token` consume `features` downstream, so dropping it at
@@ -401,9 +437,9 @@ class PatientTransformer(nn.Module):
             tokens = torch.cat([extra_tok, tokens], dim=1)
             dt = torch.cat([oldest, dt], dim=1)
             lengths = lengths + 1
-            h = self.encode(tokens, dt, strict=False, inject=(0, f))
+            h = self.encode(tokens, dt, strict=False, inject=(0, f), age0=age0)
         else:
-            h = self.encode(tokens, dt, strict=False)
+            h = self.encode(tokens, dt, strict=False, age0=age0)
 
         if self.cfg.readout == "mean":
             m = (tokens != 0).unsqueeze(-1).float()
@@ -415,23 +451,27 @@ class PatientTransformer(nn.Module):
             pooled = torch.cat([pooled, self.feat_proj(features)], dim=-1)
         return self.head(pooled)
 
-    def lm_forward(self, tokens: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+    def lm_forward(self, tokens: torch.Tensor, dt: torch.Tensor,
+                   age0: torch.Tensor | None = None) -> torch.Tensor:
         """Next-token logits for pretraining, under the strictly-earlier mask.
 
         Forced causal regardless of ``cfg.causal``: with a bidirectional mask
         the target token is in the input and the objective is trivial. The
         bidirectional arms pretrain with :meth:`mlm_forward` instead.
         """
-        return self.lm_head(self.encode(tokens, dt, strict=True, causal=True))
+        return self.lm_head(self.encode(tokens, dt, strict=True, causal=True,
+                                        age0=age0))
 
-    def mlm_forward(self, tokens: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+    def mlm_forward(self, tokens: torch.Tensor, dt: torch.Tensor,
+                    age0: torch.Tensor | None = None) -> torch.Tensor:
         """Masked-token logits, the bidirectional pretraining objective.
 
         Caller replaces a sample of positions with ``[MASK]`` and scores only
         those. Forced bidirectional: reconstructing a hidden token from one
         side only is next-token prediction with fewer signals per pass.
         """
-        return self.lm_head(self.encode(tokens, dt, strict=False, causal=False))
+        return self.lm_head(self.encode(tokens, dt, strict=False, causal=False,
+                                        age0=age0))
 
     def n_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

@@ -54,6 +54,9 @@ VARIANTS: dict[str, dict] = {
     "B7_2layer":  {"use_dt_bias": False, "n_layer": 2},
     "B4_alllabs": {"use_dt_bias": False, "seq__adaptive_bins": True},
     "B5_text":    {"use_dt_bias": False, "seq__text_answers": True},
+    # Two layers ON TOP OF the only 1-layer candidate (B1, age), compared against
+    # B1 -- still one change. Built after B1-B5 were read, as pre-registered.
+    "B7_age_2layer": {"use_dt_bias": False, "use_age_encoding": True, "n_layer": 2},
 }
 SEEDS = (300,)
 CACHE = Path("artifacts/cv_fold_cache")

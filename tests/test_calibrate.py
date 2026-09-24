@@ -28,8 +28,9 @@ def _synthetic(n=600, n_lab=8, seed=0):
 def test_platt_leaves_macro_ap_and_auroc_exactly_unchanged():
     """The whole method rests on this being a rank no-op. Check it numerically.
 
-    Positive control: make the fitted slope negative (e.g. drop the `aj > 0`
-    guard in fit_platt and feed anti-correlated scores) and this goes red.
+    Holds for every label whose fitted slope is positive, which is every label
+    in this synthetic set. Negative slopes are applied deliberately and tested
+    separately (test_negative_slope_is_applied_and_reverses_the_ranking_by_default).
     """
     P, y, ar = _synthetic()
     pp = fit_platt(P, y, ar)
@@ -109,23 +110,48 @@ def test_not_at_risk_pairs_stay_floored():
         "this test cannot detect the bug it was written for")
 
 
-def test_negative_slope_label_is_refused_not_shipped():
-    """A decreasing map would reverse that label's ranking. Such a label must
-    pass through untouched rather than be calibrated."""
-    rng = np.random.default_rng(3)
-    n = 400
+def _anti_correlated(seed=3, n=400):
+    """One label whose scores are ANTI-correlated with it -> Platt wants a < 0."""
+    rng = np.random.default_rng(seed)
     y = np.zeros((n, 1), int)
     y[:60, 0] = 1
-    # Scores ANTI-correlated with the label -> the Platt fit wants a < 0.
     s = rng.random(n)
     s[:60] *= 0.2
-    P = np.clip(s, 1e-6, 1 - 1e-6).reshape(-1, 1)
-    ar = np.ones((n, 1), bool)
+    return np.clip(s, 1e-6, 1 - 1e-6).reshape(-1, 1), y, np.ones((n, 1), bool)
 
+
+def test_negative_slope_is_refused_under_the_old_rule():
+    """allow_negative=False keeps the strict rank-no-op rule: a decreasing map is
+    refused and the label passes through untouched."""
+    P, y, ar = _anti_correlated()
+    pp = fit_platt(P, y, ar, allow_negative=False)
+    assert not pp.ok[0], "a non-positive slope was accepted under the strict rule"
+    assert np.allclose(apply_platt(P, pp, at_risk=ar), P), "refused label was modified"
+
+
+def test_negative_slope_is_applied_and_reverses_the_ranking_by_default():
+    """Default: the same fit for every label. An anti-correlated label gets a < 0,
+    and applying it must REVERSE the ranking -- AUROC goes from below to above 0.5."""
+    from sklearn.metrics import roc_auc_score
+    P, y, ar = _anti_correlated()
     pp = fit_platt(P, y, ar)
-    assert not pp.ok[0], "a non-positive slope was accepted"
+    assert pp.ok[0] and pp.a[0] < 0, f"expected an applied negative slope, got a={pp.a[0]:.3f}"
     Q = apply_platt(P, pp, at_risk=ar)
-    assert np.allclose(Q, P), "refused label was modified anyway"
+    before, after = roc_auc_score(y[:, 0], P[:, 0]), roc_auc_score(y[:, 0], Q[:, 0])
+    assert before < 0.5 < after and abs(after - (1 - before)) < 1e-9
+
+
+def test_verify_noop_still_checks_every_increasing_map():
+    """The ship-time gate excludes only negative-slope labels: a broken
+    INCREASING-map label must still trip it."""
+    P, y, ar = _synthetic()
+    Q = P.copy()
+    Q[:, 0] = 1.0 - Q[:, 0]                 # reverse label 0
+    inc = np.ones(P.shape[1], bool)
+    with pytest.raises(AssertionError):
+        verify_noop(P, Q, y, ar, labels=inc)
+    inc[0] = False                          # declared as a negative-slope label
+    verify_noop(P, Q, y, ar, labels=inc)    # the rest are untouched -> passes
 
 
 def test_labels_with_too_few_positives_pass_through():

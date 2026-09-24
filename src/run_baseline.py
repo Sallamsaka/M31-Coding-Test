@@ -304,7 +304,12 @@ def main(argv: list[str] | None = None) -> None:
             cal = apply_platt(raw, pp, at_risk=at_risk)
             # Gate on the guarantee rather than trusting it: if the ranking
             # moved, the transform is not monotone and we ship the raw scores.
-            chk = verify_noop(raw[val], cal[val], y[val], at_risk[val])
+            # Increasing maps must leave rankings untouched; labels with a
+            # deliberately negative slope (calibrate.fit_platt) are excluded
+            # from this check, not from calibration.
+            _inc = ~pp.ok | (pp.a > 0)
+            chk = verify_noop(raw[val], cal[val], y[val], at_risk[val],
+                              labels=_inc)
             if max(abs(chk["d_ap"]), abs(chk["d_auroc"])) > 1e-9:
                 print(f"  calibration REFUSED: macro AP moved {chk['d_ap']:.2e},"
                       f" AUROC {chk['d_auroc']:.2e} -- shipping raw")

@@ -76,8 +76,18 @@ class PlattParams:
 
 
 def fit_platt(P: np.ndarray, y: np.ndarray, at_risk: np.ndarray,
-              min_pos: int = 5) -> PlattParams:
+              min_pos: int = 5, allow_negative: bool = True) -> PlattParams:
     """Fit ``sigmoid(a*logit(p) + b)`` per label on at-risk pairs only.
+
+    ``allow_negative`` (default True): the SAME fitted map is applied to every
+    label with enough data, whatever the sign of ``a``. For five random-event
+    conditions (injuries, acute infections) the blend ranks worse than chance
+    out of fold -- the model scores sick patients high, and many of them die
+    inside the window with fewer years to have an accident -- so their fitted
+    slope is negative and the map reverses that ranking. Measured cross-fitted
+    (fit on 4 folds, scored on the 5th, within-fold): AUROC +0.0007, AP +0.0014
+    (not resolvable), Brier 0.04077 -> 0.04021. False restores the old rule
+    (skip labels whose slope is <= 0, so calibration never changes a ranking).
 
     Only at-risk (patient, label) pairs are used: the rest are floored to the
     bottom of the ranking by ``apply_at_risk_mask`` and are not predictions the
@@ -115,7 +125,7 @@ def fit_platt(P: np.ndarray, y: np.ndarray, at_risk: np.ndarray,
 
         # A non-positive slope is a DECREASING map: it would reverse this
         # label's ranking and break the guarantee the whole method rests on.
-        if aj > 0.0 and np.isfinite(aj) and np.isfinite(bj):
+        if np.isfinite(aj) and np.isfinite(bj) and (allow_negative or aj > 0.0):
             a[j], b[j], ok[j] = aj, bj, True
 
     return PlattParams(a=a, b=b, ok=ok)
@@ -183,8 +193,14 @@ def murphy(P: np.ndarray, y: np.ndarray, at_risk: np.ndarray,
 
 
 def verify_noop(P: np.ndarray, Q: np.ndarray, y: np.ndarray,
-                at_risk: np.ndarray, tol: float = 1e-9) -> dict:
+                at_risk: np.ndarray, tol: float = 1e-9,
+                labels: np.ndarray | None = None) -> dict:
     """Assert calibration left macro AP and macro AUROC untouched.
+
+    ``labels`` restricts the check to those columns -- the labels whose map is
+    increasing, where the guarantee must hold. Labels with a deliberately
+    negative slope (see ``fit_platt``) are excluded by the caller, not waved
+    through: every increasing map is still checked.
 
     Sec E34.1's argument says it must. This checks it, because an argument that
     is right about the maths and wrong about the code is indistinguishable from
@@ -192,6 +208,9 @@ def verify_noop(P: np.ndarray, Q: np.ndarray, y: np.ndarray,
     """
     from .evaluate import macro_ap, macro_auroc
 
+    if labels is not None:
+        cols = np.asarray(labels, bool)
+        P, Q, y, at_risk = P[:, cols], Q[:, cols], y[:, cols], at_risk[:, cols]
     ap0, _ = macro_ap(y, P, mask=at_risk)
     ap1, _ = macro_ap(y, Q, mask=at_risk)
     au0, _ = macro_auroc(y, P, mask=at_risk)
@@ -299,7 +318,10 @@ def main() -> None:
           "or non-positive slope)")
 
     Qv = apply_platt(Pv, pp, at_risk=arv)
-    chk = verify_noop(Pv, Qv, yv, arv)
+    inc = ~pp.ok | (pp.a > 0)
+    print(f"  {int((pp.ok & (pp.a <= 0)).sum())} labels have a negative slope "
+          "(ranking deliberately reversed); rank no-op checked on the rest")
+    chk = verify_noop(Pv, Qv, yv, arv, labels=inc)
     print(f"  no-op check: macro AP {chk['ap']:.4f} moved {chk['d_ap']:.2e}, "
           f"macro AUROC {chk['auroc']:.4f} moved {chk['d_auroc']:.2e}  OK\n")
 

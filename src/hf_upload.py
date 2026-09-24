@@ -48,8 +48,10 @@ reads one token per event with a Time2Vec encoding of time before the anchor **a
 of the patient's age at that event**, and fuses the 3,320 tabular features at the
 readout; 3 seeds averaged in logit space. Files: `model_lr.joblib`,
 `model_gbdt.joblib`, `model_transformer.joblib` (the transformer's output matrix),
-`model_P4_seed300_*.pt` / `seed301` / `seed302` (its weights), `platt_params.npz`,
-`submission_manifest.joblib`.
+`transformer_seed300.pt` / `transformer_seed301.pt` / `transformer_seed302.pt`
+(its weights, one per seed), `platt_params.npz` (the 40 calibration maps),
+`submission_manifest.joblib` (how the three models are combined), `vocab.json`
+(the transformer's vocabulary).
 
 ## Task
 
@@ -59,14 +61,21 @@ readout; 3 seeds averaged in logit space. Files: `model_lr.joblib`,
   A patient already diagnosed before the anchor is *prevalent*: structurally
   negative, and reported separately rather than counted as an ordinary negative.
 
-## Results (validation, n=365)
+## Results
 
-{metrics}
+The test set's outcomes are withheld, so performance is estimated by 5-fold
+cross-validation over the 2,791 training patients: each fold is predicted by
+models trained on the other four (the transformer uses the provided validation
+set only to choose its stopping epoch). Mean ± SD over the 5 test folds:
 
-The validation set resolves differences of roughly **±0.01 macro AUROC** and no
-better. Per-condition AUROC on the rarest label (5 positives) carries a
-Hanley–McNeil 95% interval of about ±0.24. Numbers below that separation are
-reported but should not be read as rankings.
+| model | macro AUROC | macro AP |
+|---|---|---|
+| logistic regression | 0.7595 ± 0.0056 | 0.2077 ± 0.0192 |
+| gradient-boosted trees | 0.7640 ± 0.0081 | 0.2260 ± 0.0185 |
+| transformer (3 seeds) | 0.7661 ± 0.0065 | 0.2203 ± 0.0157 |
+| **submitted: blend of the three, calibrated** | **0.7755 ± 0.0028** | **0.2435 ± 0.0220** |
+
+(Calibration in the last row is cross-fitted: fitted on four folds, scored on the fifth.)
 
 ## What the model is actually learning
 
@@ -98,9 +107,13 @@ wins here, that ranking should not be assumed to transfer.**
 ## Reproducing
 
 ```bash
-git clone https://github.com/Sallamsaka/M31-Coding-Test && pip install -r requirements.txt
-./run_all.ps1
+git clone https://github.com/Sallamsaka/M31-Coding-Test && cd M31-Coding-Test
+pip install -r requirements.txt
+# put the provided data (train_val/, test/, the three CSVs) in the repo root, then:
+python -m src.reproduce --from-hub sallamsaka/M31-Coding-Test   # predictions from these files, no training
 ```
+
+Retraining everything from scratch is described in the GitHub README.
 """
 
 
@@ -210,6 +223,9 @@ def upload(repo: str, root: Path | str = ".", dry_run: bool = False) -> None:
     uploaded = set()
     for p in files:
         name = "README.md" if p == card else p.name
+        if name.startswith("model_P4_seed") and name.endswith(".pt"):
+            # Readable names on the Hub; the fingerprint is listed in the card.
+            name = f"transformer_seed{name.split('_seed')[1].split('_')[0]}.pt"
         api.upload_file(path_or_fileobj=str(p), path_in_repo=name,
                         repo_id=repo, repo_type="model")
         uploaded.add(name)
@@ -219,7 +235,8 @@ def upload(repo: str, root: Path | str = ".", dry_run: bool = False) -> None:
     # reviewer could not tell which is the submitted model. Remove ONLY stale
     # transformer checkpoints -- never anything else in the repository.
     for name in api.list_repo_files(repo, repo_type="model"):
-        if name.startswith("model_P4_seed") and name.endswith(".pt") and name not in uploaded:
+        stale_ckpt = name.endswith(".pt") and name.startswith(("model_P4_seed", "transformer_seed"))
+        if stale_ckpt and name not in uploaded:
             api.delete_file(name, repo_id=repo, repo_type="model",
                             commit_message=f"remove superseded checkpoint {name}")
             print(f"  deleted stale {name}")

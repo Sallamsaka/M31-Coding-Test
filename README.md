@@ -23,6 +23,12 @@ python -m src.calibrate --fit oof --model ens_lr_gbdt_tx --oof-model lr+gbdt+tra
 python -m src.run_baseline --with-transformer --recipe ens_lr_gbdt_tx   # -> predictions.csv
 ```
 
+To regenerate `predictions.csv` from the published model files without training:
+
+```powershell
+python -m src.reproduce --from-hub sallamsaka/M31-Coding-Test
+```
+
 `.\run_all.ps1 -Smoke` runs every code path in a few minutes.
 
 ## Model

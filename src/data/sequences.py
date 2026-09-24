@@ -56,7 +56,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .cohort import load_cohort, load_events
+from .cohort import load_cohort, load_events, load_obs_text
 from .examples import ExampleConfig, load_examples
 
 __all__ = ["SeqConfig", "Vocab", "SeqPack", "build_vocab", "build_sequences",
@@ -71,6 +71,13 @@ class SeqConfig:
     min_patients_per_code: int = 5
     n_value_bins: int = 10
     fuse_min_events_per_bin: int = 50   # below this, fall back to a shared Q token
+    text_answers: bool = False
+    """Fuse a text-valued observation's answer into its token.
+
+    ``OBS_72166-2=Former smoker`` instead of ``OBS_72166-2`` for every (code,
+    answer) pair seen in >= min_patients_per_code training patients; rarer
+    answers keep the plain code. Off (default) reproduces the old vocabulary.
+    """
     adaptive_bins: bool = False
     """Fuse EVERY numeric lab, with as many levels as its volume supports.
 
@@ -217,6 +224,20 @@ def build_vocab(root: Path | str = ".", cfg: SeqConfig | None = None,
         else:
             itos.append(tok)
 
+    # Text answers (flag): new rows for (code, answer) pairs, before [MASK].
+    text_pairs = []
+    if cfg.text_answers:
+        ot = load_obs_text(root)
+        ot = ot[ot.pid.isin(train_pids)].assign(ts=lambda d: d.ts.astype("datetime64[ns]"))
+        # Pre-anchor and kind-filtered by construction: join onto `ev`.
+        j = ev[["pid", "ts", "token"]].astype({"token": str}).assign(
+            pid=lambda d: d.pid.astype("int64"),
+            ts=lambda d: d.ts.astype("datetime64[ns]")).merge(ot, on=["pid", "ts", "token"])
+        pp = (j.token + "=" + j.answer).groupby(j.pid).unique().explode()
+        npat = pp.value_counts()
+        text_pairs = sorted(npat[npat >= cfg.min_patients_per_code].index)
+        itos += text_pairs
+
     # Appended LAST on purpose: inserting it near [PAD] would shift every
     # code's id and silently invalidate any cached tokenisation.
     itos.append(MASK)
@@ -240,6 +261,7 @@ def build_vocab(root: Path | str = ".", cfg: SeqConfig | None = None,
         "n_codes_kept": len(keep), "n_fused_codes": len(fused),
         "min_patients_per_code": cfg.min_patients_per_code,
         "adaptive_bins": cfg.adaptive_bins,
+        "text_answers": cfg.text_answers, "n_text_pairs": len(text_pairs),
     })
 
 
@@ -282,6 +304,25 @@ def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
         else:
             ids[i] = vocab.get(t, kind[i])
 
+    if vocab.meta.get("text_answers"):
+        ot = load_obs_text(root)
+        # Both sides at ns: a parquet round trip can change datetime resolution,
+        # and a resolution mismatch would match nothing (the assert below).
+        ans = ot.assign(ts=ot.ts.astype("datetime64[ns]")).set_index(
+            ["pid", "ts", "token"]).answer
+        key = pd.MultiIndex.from_arrays([pre.pid.astype("int64").to_numpy(),
+                                         pre.ts.astype("datetime64[ns]").to_numpy(),
+                                         pre.token.astype(str).to_numpy()])
+        a = ans.reindex(key).to_numpy()
+        n_hit = 0
+        for i in np.flatnonzero(pd.notna(a)):
+            t2 = vocab.stoi.get(f"{tok[i]}={a[i]}")
+            if t2 is not None:
+                ids[i] = t2
+                n_hit += 1
+        # A silent zero would make B5 a copy of B0 that "shows nothing".
+        assert n_hit > 0, "text_answers on but no answer token was emitted"
+        print(f"  text answers fused into {n_hit:,} events", flush=True)
     if vocab.meta.get("adaptive_bins"):
         # The point of the flag: no numeric event may be split into two positions.
         assert int((extra_q >= 0).sum()) == 0, "adaptive_bins emitted a shared Q token"

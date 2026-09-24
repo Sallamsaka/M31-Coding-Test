@@ -53,6 +53,7 @@ VARIANTS: dict[str, dict] = {
     "B3_reason":  {"use_dt_bias": False, "use_reason_embedding": True},
     "B7_2layer":  {"use_dt_bias": False, "n_layer": 2},
     "B4_alllabs": {"use_dt_bias": False, "seq__adaptive_bins": True},
+    "B5_text":    {"use_dt_bias": False, "seq__text_answers": True},
 }
 SEEDS = (300,)
 CACHE = Path("artifacts/cv_fold_cache")

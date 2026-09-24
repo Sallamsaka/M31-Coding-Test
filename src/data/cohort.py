@@ -334,6 +334,42 @@ def _deps(root: Path) -> list[Path]:
     return files
 
 
+def _build_obs_text(root: Path, cohort: pd.DataFrame) -> pd.DataFrame:
+    """Text-valued observation answers, keyed like the event frame.
+
+    The event frame keeps an observation's VALUE only when TYPE is numeric, so
+    7.3% of observation rows -- smoking status, the urinalysis panel -- reach
+    every model as "this was assessed" with the answer dropped (§E56.1). This
+    table carries the answer, keyed on (pid, ts, token) exactly as the events
+    are, so a sequence can fuse it into the token without changing the cached
+    event frame every other consumer reads.
+    """
+    pid_of = pd.Series(cohort.pid.values, index=cohort.patient_id.values)
+    parts = []
+    for sub in ("train_val", "test"):
+        df = pd.read_csv(root / sub / "observations.csv",
+                         usecols=["DATE", "PATIENT", "CODE", "VALUE", "TYPE"],
+                         dtype={"CODE": str, "VALUE": str})
+        df = df[df.TYPE.ne("numeric") & df.VALUE.notna()]
+        df = df.assign(pid=df.PATIENT.map(pid_of))
+        df = df[df.pid.notna()]
+        parts.append(pd.DataFrame({
+            "pid": df.pid.astype("int64").to_numpy(),
+            "ts": to_ts(df.DATE).to_numpy(),
+            "token": ("OBS_" + df.CODE).to_numpy(),
+            "answer": df.VALUE.astype(str).str.strip().to_numpy(),
+        }))
+    return (pd.concat(parts, ignore_index=True)
+            .drop_duplicates(["pid", "ts", "token"]).reset_index(drop=True))
+
+
+def load_obs_text(root: Path | str = ".", rebuild: bool = False) -> pd.DataFrame:
+    root = Path(root)
+    cohort = load_cohort(root)
+    return cached_parquet("obs_text", lambda: _build_obs_text(root, cohort),
+                          _deps(root), rebuild=rebuild)
+
+
 def load_cohort(root: Path | str = ".", rebuild: bool = False) -> pd.DataFrame:
     root = Path(root)
     return cached_parquet("cohort", lambda: _build_cohort(root), _deps(root),

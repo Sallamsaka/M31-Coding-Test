@@ -40,6 +40,17 @@ recorded strictly before it.
 Trained for the M31 research-intern take-home. **Synthetic data only. Not a
 clinical device, and not usable for any decision about a real person.**
 
+## Model
+
+`sigmoid((logit(LR) + logit(GBDT) + logit(transformer)) / 3)`, per-label Platt
+calibrated (fitted out-of-fold). The transformer is 1 layer / width 64 / 2 heads,
+reads one token per event with a Time2Vec encoding of time before the anchor **and
+of the patient's age at that event**, and fuses the 3,320 tabular features at the
+readout; 3 seeds averaged in logit space. Files: `model_lr.joblib`,
+`model_gbdt.joblib`, `model_transformer.joblib` (the transformer's output matrix),
+`model_P4_seed300_*.pt` / `seed301` / `seed302` (its weights), `platt_params.npz`,
+`submission_manifest.joblib`.
+
 ## Task
 
 - 3,514 Synthea patients, split 2,791 train / 365 validation / 358 test.
@@ -74,7 +85,7 @@ be interpreted.
 load time. `STOP`-derived durations are excluded: the organisers blanked
 post-anchor stops in the test split, so such a feature would both leak and
 shift. Every fitted statistic — vocabulary, quantile edges, scalers — is fitted
-on training patients only. 63 automated checks cover this, including a grep
+on training patients only. 150 automated checks cover this, including a grep
 test that no module outside the time utility parses a timestamp.
 
 ## Limitations
@@ -196,11 +207,22 @@ def upload(repo: str, root: Path | str = ".", dry_run: bool = False) -> None:
     from huggingface_hub import HfApi           # noqa: PLC0415
     api = HfApi(token=token)
     api.create_repo(repo, exist_ok=True, repo_type="model")
+    uploaded = set()
     for p in files:
         name = "README.md" if p == card else p.name
         api.upload_file(path_or_fileobj=str(p), path_in_repo=name,
                         repo_id=repo, repo_type="model")
+        uploaded.add(name)
         print(f"  uploaded {name}")
+    # upload_file never deletes. A retrained transformer has new fingerprints,
+    # so the previous seed checkpoints would sit beside the new ones and a
+    # reviewer could not tell which is the submitted model. Remove ONLY stale
+    # transformer checkpoints -- never anything else in the repository.
+    for name in api.list_repo_files(repo, repo_type="model"):
+        if name.startswith("model_P4_seed") and name.endswith(".pt") and name not in uploaded:
+            api.delete_file(name, repo_id=repo, repo_type="model",
+                            commit_message=f"remove superseded checkpoint {name}")
+            print(f"  deleted stale {name}")
     print(f"[hf_upload] https://huggingface.co/{repo}")
 
 

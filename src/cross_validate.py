@@ -99,7 +99,12 @@ MODELS = ("prevalence", "trivial", "lr_default", "lr", "gbdt", "transformer")
 # run. It is the cheapest thing in the loop except LR.
 TRANSFORMER_CFG = dict(n_layer=1, n_embd=64, n_head=2, lr=0.0012,
                        weight_decay=0.001, attn_dropout=0.0, resid_dropout=0.0,
-                       fusion="readout", fusion_dim=128, modality_dropout=0.0)
+                       fusion="readout", fusion_dim=128, modality_dropout=0.0,
+                       # §E57.3: age at each event, confirmed at 3 seeds and at
+                       # the blend (+0.0056 AP [+0.0020, +0.0099]). The dt bias
+                       # goes with it: measured inert (§E56.2), and every sweep
+                       # arm -- including the one confirmed -- ran without it.
+                       use_age_encoding=True, use_dt_bias=False)
 TRANSFORMER_SEEDS = (300, 301, 302)
 
 

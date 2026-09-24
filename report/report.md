@@ -611,6 +611,64 @@ more than it would for a generic model: three of the representation gaps in §1
 (the inert mask, orphaned rare-lab levels, and drug↔reason links) are specifically
 one-layer limitations.
 
+### A pre-registered one-change sweep, and the one change that works
+
+The walk-through in §1 produced six concrete ideas. Each was tested as exactly one
+change against the same baseline, on the same five cross-validation folds (all
+2,791 training patients scored once out of fold). The adoption rule was committed to
+the repository before any comparison existed.
+
+- **Baseline B0:** the shipped recipe with the inert Δt bias switched off.
+- **Rule:** an arm is a candidate if P(better) ≥ 0.75 on one metric and the other
+  metric's point estimate is not negative. A candidate is adopted only if it survives
+  confirmation.
+- **Resolution:** derived beforehand at one seed, the standard error of a paired
+  difference is ≈0.0093 AP and ≈0.0027 AUROC. So most small ideas were *expected* to
+  read "not resolvable", and picking the best of five noise-only arms would inflate
+  the winner by ≈0.017 AP. That is why a candidate needs confirmation.
+
+| change vs B0 (transformer alone, 2,791 rows) | Δ macro AP [95% CI] | Δ macro AUROC [95% CI] | verdict |
+|---|---|---|---|
+| **+ age at each event** | **+0.0100 [+0.0023, +0.0177]** | **+0.0098 [+0.0035, +0.0159]** | **candidate** |
+| 4 heads × 16 instead of 2 × 32 | −0.0014 [−0.0071, +0.0049] | −0.0017 [−0.0057, +0.0028] | no |
+| + reason-code embedding | −0.0028 [−0.0105, +0.0029] | −0.0037 [−0.0086, +0.0016] | no |
+| every lab fused into its token | +0.0023 [−0.0047, +0.0088] | −0.0032 [−0.0089, +0.0023] | no |
+| + text answers (smoking, urinalysis) | +0.0006 [−0.0067, +0.0075] | −0.0036 [−0.0089, +0.0020] | no |
+| 2 layers, on top of age (vs age alone) | −0.0016 [−0.0073, +0.0053] | −0.0042 [−0.0102, +0.0024] | no |
+
+**Age at each event was then confirmed.** The confirmation re-ran the baseline and the
+age arm at two new seeds, which were never used to pick the winner, so it carries no
+selection bias. Age won at all three seeds on both metrics. Averaged over three seeds
+the way the submission averages them:
+
+| age − baseline, 3 seeds | Δ macro AP [95% CI] | Δ macro AUROC [95% CI] |
+|---|---|---|
+| transformer alone | +0.0143 [+0.0056, +0.0210] | +0.0114 [+0.0061, +0.0166] |
+| **the submitted LR + GBDT + transformer blend** | **+0.0056 [+0.0020, +0.0099]** | **+0.0043 [+0.0020, +0.0064]** |
+| blend, the two unselected seeds only | +0.0062 [+0.0023, +0.0109] | +0.0039 [+0.0013, +0.0063] |
+
+This is the largest transformer gain since feature fusion, and it resolves at the
+level that is actually submitted. The mechanism follows from §1. A one-layer model
+reads a set of (event, time-before-anchor) items, and the only age signal was a
+single feature at the readout. Synthea's disease modules trigger on age, and "first
+seen at 25" versus "first seen at 55" is exactly what time-before-anchor cannot
+express. Age at each event puts that inside every item.
+
+The nulls are informative too:
+
+- **Heads.** Four heads cost nothing in parameters and make the blend resolvably
+  worse on AP (−0.0029 [−0.0056, −0.0000]); the two heads already specialise.
+- **Reasons.** The reason embedding adds a link the model mostly already has: 92.6%
+  of reasons are a diagnosis token by the same day.
+- **Labs and text answers.** Fusing every lab touches 0.76% of numeric events, and the
+  text answers carry little signal — the feature-side test on LR was a tiny negative.
+- **A second layer.** It adds nothing on top of age, which settles the depth question
+  §2 left open, at least for this model.
+
+**Not yet in the submission.** These results arrived after the submitted model was
+built. Swapping it in means re-running cross-validation, calibration, the final fit,
+the Hugging Face upload and the wandb log (about 2.5 hours). It is the first item of §5.
+
 ### What the validation set can and cannot resolve
 
 Hanley–McNeil standard errors at these positive counts:
@@ -940,11 +998,11 @@ cross-validation replaced validation as the selection instrument (§0), and seed
 variance is measured (three seeds per configuration; averaging them is worth
 +0.013 AP). What remains, ranked by expected value per hour:
 
-**1. A second layer, varied alone.** The only architecture question with a
-plausible effect this instrument could see. Depth was only ever varied jointly
-with width and heads (§2), and three of the representation gaps in §1 — the inert
-mask, orphaned rare-lab levels, unbound drug↔reason links — exist *because* the
-model has one layer. Tested overnight as part of the sweep below.
+**1. Ship age at each event.** Confirmed at three seeds and at the submission level
+(blend +0.0056 AP [+0.0020, +0.0099], +0.0043 AUROC [+0.0020, +0.0064]; §2). The
+code is in the repository behind `use_age_encoding`. What remains is the rebuild:
+transformer cross-validation at three seeds, recalibration, the final fit, and
+re-publishing the model and its curves.
 
 **2. Pretrain on whole training timelines.** The next-event warm-up saw only the
 935,483 pre-anchor events of training patients; their 955,228 post-anchor events
@@ -953,12 +1011,12 @@ It still adds no patients, which is why the measured pretraining null (§2) may
 survive it — but it is the only pretraining variant with a mechanism for a larger
 effect. It needs after-anchor codes in the vocabulary, which nothing else does.
 
-**3. Encode each event completely at one layer.** Age at each event, the reason
-a drug was given, the answer of a text-valued observation, and every lab's level
-inside its own token instead of a second position. At one layer these must live
-inside the event's own vector, because nothing else can bind them together. The
-sweep below measures the first two; text answers were measured on the feature
-side and are slightly negative for LR (AUROC −0.0009 [−0.0016, −0.0002]).
+**3. Other per-event information, lower priority now.** The sweep (§2) measured the
+reason a drug was given, text answers, and every lab's level fused into its token:
+all three are nulls at this resolution, and so were four heads and a second layer.
+The one per-event addition that mattered was age. The natural next candidates are
+the same kind of thing — facts about the *patient at that moment* that time before
+the anchor cannot express, such as years since first contact.
 
 **4. Death as an auxiliary training target.** §4's central finding is that the
 outcome window is often a patient's last five years. Death inside the window is a
@@ -973,8 +1031,9 @@ domain-shift diagnostic (§4) does not rule out.
 age-residual blocks can only pay off through interactions a linear model cannot
 express, so their null on logistic regression is uninformative about them.
 
-Notably absent: a much larger transformer. The only "larger" configuration tested
-cleanly lost (−0.0087 AP, three of three seeds), the model measurably overfits
+Notably absent: a larger transformer. The joint "larger" configuration lost (−0.0087
+AP, three of three seeds), a second layer alone added nothing on top of age (§2),
+four heads made the blend worse, the model measurably overfits
 (validation loss turns up after epoch 5–6), and the learning curve says the
 binding constraint is patients.
 

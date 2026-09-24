@@ -147,14 +147,16 @@ class TrainConfig:
     use_time_encoding: bool = True
     """Per-token Time2Vec on/off. See GPTConfig for what off means."""
     use_dt_bias: bool = True
-    use_age_encoding: bool = False
-    """See GPTConfig.use_age_encoding. False is inert and is the default."""
     """Pairwise Δt attention bias on/off.
 
     Both zero a signal rather than deleting a tensor, so every ablation arm has
     the same parameter count and the comparison measures the component instead
     of the capacity.
     """
+    use_age_encoding: bool = False
+    """See GPTConfig.use_age_encoding. False is inert and is the default."""
+    use_reason_embedding: bool = False
+    """See GPTConfig.use_reason_embedding. False is inert and is the default."""
 
     # --- capacity and regularisation, searchable ---------------------------
     n_layer: int = 4
@@ -258,10 +260,19 @@ def _trim(tokens: np.ndarray, dt: np.ndarray, lengths: np.ndarray,
             torch.from_numpy(lengths[rows].astype(np.int64)))
 
 
+def _rs(reasons: np.ndarray | None, lengths: np.ndarray, rows: np.ndarray):
+    """The reasons batch, cut exactly as `_trim` cuts tokens."""
+    if reasons is None:
+        return None
+    m = int(lengths[rows].max())
+    return torch.from_numpy(reasons[rows, :m].astype(np.int64))
+
+
 @torch.no_grad()
 def predict(model: PatientTransformer, tokens, dt, lengths, rows,
             batch_size: int = 64, features: np.ndarray | None = None,
-            age: np.ndarray | None = None) -> np.ndarray:
+            age: np.ndarray | None = None,
+            reasons: np.ndarray | None = None) -> np.ndarray:
     model.eval()
     out = []
     order = rows[np.argsort(lengths[rows], kind="stable")]
@@ -270,7 +281,9 @@ def predict(model: PatientTransformer, tokens, dt, lengths, rows,
         t, d, L = _trim(tokens, dt, lengths, b)
         fb = torch.from_numpy(features[b]) if features is not None else None
         ab = torch.from_numpy(age[b]) if age is not None else None
-        out.append((b, torch.sigmoid(model(t, d, L, features=fb, age0=ab)).numpy()))
+        rb = _rs(reasons, lengths, b)
+        out.append((b, torch.sigmoid(model(t, d, L, features=fb, age0=ab,
+                                           reasons=rb)).numpy()))
     P = np.zeros((len(rows), out[0][1].shape[1]), np.float32)
     pos = {r: k for k, r in enumerate(rows)}
     for b, p in out:
@@ -346,7 +359,8 @@ def pretrain(model: PatientTransformer, pack, rows: np.ndarray, objective: str,
                   if pack.age_days is not None else None)
             real = tok != 0
             if objective == "lm":
-                logits = model.lm_forward(tok, dt, age0=a0)
+                logits = model.lm_forward(tok, dt, age0=a0,
+                                          reasons=_rs(pack.reasons, pack.lengths, batch))
                 # position i predicts token i+1
                 loss = F.cross_entropy(
                     logits[:, :-1].reshape(-1, logits.size(-1)),
@@ -358,7 +372,8 @@ def pretrain(model: PatientTransformer, pack, rows: np.ndarray, objective: str,
                 if not sel.any():
                     continue
                 corrupted = tok.masked_fill(sel, mask_id)
-                logits = model.mlm_forward(corrupted, dt, age0=a0)
+                logits = model.mlm_forward(corrupted, dt, age0=a0,
+                                           reasons=_rs(pack.reasons, pack.lengths, batch))
                 loss = F.cross_entropy(logits[sel], tok[sel])
 
             opt.zero_grad(set_to_none=True)
@@ -517,6 +532,8 @@ def _config_fingerprint(cfg: "TrainConfig", arm: str, vocab_size: int,
     # fail on shapes at best. Appended only when on, so no checkpoint is orphaned.
     if getattr(cfg, "use_age_encoding", False):
         blob += "|age=1"
+    if getattr(cfg, "use_reason_embedding", False):
+        blob += "|reason=1"
     # The pretraining objective and budget change what the weights become, so
     # they identify the checkpoint. Without this, P1 at 8 pretraining epochs and
     # P1 at 4 share a slot and a run id -- and a resumed run would load the
@@ -666,6 +683,16 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
         fit_pids = set(fold_pids)
     vocab = build_vocab(root, seq_cfg, fit_pids=fit_pids)
     pack = build_sequences(root, vocab, seq_cfg, ex_cfg)
+    if cfg.use_reason_embedding:
+        # A reasons array that silently came out all-zero would train a model
+        # that "has" the embedding and reports a clean null. Measured: 25% of
+        # pre-anchor events carry a reason; positions also include headers and
+        # value tokens, so the share of real positions is somewhat lower.
+        _real = pack.tokens != 0
+        _share = float((pack.reasons[_real] > 0).mean())
+        print(f"  reasons: {_share:.1%} of real positions carry one "
+              f"({len(vocab.reasons)} reason ids)", flush=True)
+        assert 0.05 < _share < 0.5, f"implausible reason coverage {_share:.3f}"
 
     # CORRUPTION CONTROL (E9.1 owed one). Permute which patient's SEQUENCE goes
     # with which patient's features and labels, leaving everything else intact.
@@ -690,7 +717,9 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
         pack = _replace(pack, tokens=pack.tokens[_perm], dt=pack.dt[_perm],
                         lengths=pack.lengths[_perm],
                         age_days=(pack.age_days[_perm]
-                                  if pack.age_days is not None else None))
+                                  if pack.age_days is not None else None),
+                        reasons=(pack.reasons[_perm]
+                                 if pack.reasons is not None else None))
         if verbose:
             print("  ⚠ CORRUPTION CONTROL: sequences permuted across patients",
                   flush=True)
@@ -762,6 +791,8 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
         attn_dropout=cfg.attn_dropout, resid_dropout=cfg.resid_dropout,
         use_time_encoding=cfg.use_time_encoding, use_dt_bias=cfg.use_dt_bias,
         use_age_encoding=cfg.use_age_encoding,
+        use_reason_embedding=cfg.use_reason_embedding,
+        n_reasons=len(vocab.reasons),
         fusion=cfg.fusion, fusion_dim=cfg.fusion_dim,
         modality_dropout=cfg.modality_dropout,
         n_features=(feats.shape[1] if feats is not None else 0)))
@@ -869,7 +900,8 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
             fb = torch.from_numpy(feats[rows]) if feats is not None else None
             ab = (torch.from_numpy(pack.age_days[rows])
                   if pack.age_days is not None else None)
-            logits = model(t, d, L, features=fb, age0=ab)
+            logits = model(t, d, L, features=fb, age0=ab,
+                           reasons=_rs(pack.reasons, pack.lengths, rows))
             r = torch.from_numpy(rows.astype(np.int64))
             # Prevalent pairs contribute no gradient, but the row still trains
             # the trunk through its other 39 labels.
@@ -911,7 +943,8 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
 
         if (epoch + 1) % cfg.eval_every == 0 or epoch == cfg.epochs - 1:
             P = predict(model, pack.tokens, pack.dt, pack.lengths, va,
-                        features=feats, age=pack.age_days)
+                        features=feats, age=pack.age_days,
+                        reasons=pack.reasons)
             Pm = np.where(ar[va].astype(bool), P, 1e-6)
             au, _ = macro_auroc(y[va].astype(int), Pm)
             apv, _ = macro_ap(y[va].astype(int), Pm)
@@ -933,7 +966,8 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
                     model.load_state_dict({k: v.to(live[k].dtype)
                                            for k, v in avg.items()})
                     Pe = predict(model, pack.tokens, pack.dt, pack.lengths, va,
-                                 features=feats, age=pack.age_days)
+                                 features=feats, age=pack.age_days,
+                                 reasons=pack.reasons)
                     Pem = np.where(ar[va].astype(bool), Pe, 1e-6)
                     ema_au = macro_auroc(y[va].astype(int), Pem)[0]
                     ema_ap = macro_ap(y[va].astype(int), Pem)[0]
@@ -979,7 +1013,8 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
                     best["all_preds"] = predict(model, pack.tokens, pack.dt,
                                                 pack.lengths, _all,
                                                 features=feats,
-                                                age=pack.age_days)
+                                                age=pack.age_days,
+                                                reasons=pack.reasons)
                 # The reported score is a MAX over epochs taken on the very set
                 # that selects the epoch, so it carries a winner's curse of the
                 # same shape as the one G1 measures on validation. It is not
@@ -994,7 +1029,8 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
                 # than argued about.
                 if len(hold) and not np.array_equal(hold, va):
                     Ph = predict(model, pack.tokens, pack.dt, pack.lengths,
-                                 hold, features=feats, age=pack.age_days)
+                                 hold, features=feats, age=pack.age_days,
+                                 reasons=pack.reasons)
                     Phm = np.where(ar[hold].astype(bool), Ph, 1e-6)
                     best["holdout_macro_auroc"] = macro_auroc(
                         y[hold].astype(int), Phm)[0]

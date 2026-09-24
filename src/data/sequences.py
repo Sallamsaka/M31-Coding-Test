@@ -82,6 +82,9 @@ class Vocab:
     edges: dict[str, list[float]]     # code -> decile cut points, train-fitted
     fused: set[str]                   # codes whose value is fused into the token
     meta: dict = field(default_factory=dict)
+    # REASONCODE -> id. 0 = no reason, 1 = unseen reason. Train-fitted like the
+    # rest of the vocabulary; only read when use_reason_embedding is on.
+    reasons: dict = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.itos)
@@ -107,6 +110,8 @@ class SeqPack:
     # Age at this example's cutoff, in days. One number per example: the model
     # derives age at every event as `age_days - dt`, so no sequence changes.
     age_days: np.ndarray | None = None
+    # Reason id per position, parallel to `tokens` (0 = none / header / anchor).
+    reasons: np.ndarray | None = None
 
     def __repr__(self) -> str:  # pragma: no cover
         return (f"SeqPack(tokens={self.tokens.shape}, "
@@ -200,7 +205,15 @@ def build_vocab(root: Path | str = ".", cfg: SeqConfig | None = None,
 
     stoi = {t: i for i, t in enumerate(itos)}
     assert stoi[PAD] == 0, "PAD must be 0 so padding_idx=0 and masks are != 0"
-    return Vocab(stoi, itos, edges, fused, meta={
+
+    # Reasons: same fit set and the same >= min_patients rule as codes.
+    _r = ev[ev.reason.notna()]
+    _rp = _r.groupby(_r.reason.astype(str), observed=True).pid.nunique()
+    reasons = {"[NO_REASON]": 0, "[UNK_REASON]": 1}
+    for _code in sorted(_rp[_rp >= cfg.min_patients_per_code].index):
+        reasons[_code] = len(reasons)
+
+    return Vocab(stoi, itos, edges, fused, reasons=reasons, meta={
         "split": "train", "n_patients": len(train_pids),
         # Records whether the fit set was narrowed below the full train split,
         # so a vocabulary built for an inner-CV fold is distinguishable from
@@ -251,16 +264,23 @@ def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
             ids[i] = vocab.get(t, kind[i])
 
     pre["tid"], pre["qid"] = ids, extra_q
+    _rs = pre.reason.astype(object)
+    _known = _rs.map(vocab.reasons)
+    pre["rid"] = np.where(_rs.isna(), 0,
+                          np.where(_known.isna(), 1, _known.fillna(0))).astype(np.int32)
     pre = pre.sort_values(["pid", "ts_seq", "ko", "token"])
 
     # Flatten the optional value token into its own position, at the SAME
     # instant, so a slice by timestamp can never separate a code from its value.
     tid_v, qid_v = pre.tid.to_numpy(), pre.qid.to_numpy()
+    rid_v = pre.rid.to_numpy()
     ts_v, pid_v = pre.ts_seq.to_numpy(), pre.pid.to_numpy()
     has_q = qid_v >= 0
     order = np.argsort(np.concatenate([np.arange(len(pre)) * 2,
                                        np.flatnonzero(has_q) * 2 + 1]), kind="stable")
     flat_tok = np.concatenate([tid_v, qid_v[has_q]])[order]
+    # A shared Q value token carries no reason of its own.
+    flat_rid = np.concatenate([rid_v, np.zeros(int(has_q.sum()), np.int32)])[order]
     flat_ts = np.concatenate([ts_v, ts_v[has_q]])[order]
     flat_pid = np.concatenate([pid_v, pid_v[has_q]])[order]
 
@@ -275,6 +295,7 @@ def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
     D = np.zeros((n, L), np.float32)
     lens = np.zeros(n, np.int32)
     age = np.zeros(n, np.float32)
+    RS = np.zeros((n, L), np.int32)
 
     demo_cols = [("gender", "SEX"), ("race", "RACE"),
                  ("ethnicity", "ETH"), ("marital", "MARITAL")]
@@ -302,6 +323,7 @@ def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
         age[row.eid] = (cut - np.datetime64(d["birthdate"])) / np.timedelta64(1, "D")
         T[row.eid, :len(head)] = head
         T[row.eid, len(head):k - 1] = body_t
+        RS[row.eid, len(head):k - 1] = flat_rid[lo:stop]
         T[row.eid, k - 1] = anchor_tok
         first_dt = float(body_d[0]) if len(body_d) else 0.0
         D[row.eid, :len(head)] = first_dt
@@ -312,4 +334,4 @@ def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
     return SeqPack(tokens=T, dt=D, lengths=lens,
                    eid=ex.eid.to_numpy(), pid=ex.pid.to_numpy(),
                    split=ex.split.to_numpy().astype("U5"),
-                   is_real=ex.is_real.to_numpy(), age_days=age)
+                   is_real=ex.is_real.to_numpy(), age_days=age, reasons=RS)

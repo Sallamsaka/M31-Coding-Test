@@ -15,6 +15,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt          # noqa: E402
+import matplotlib.ticker                 # noqa: E402,F401  (MaxNLocator)
 import numpy as np                       # noqa: E402
 import pandas as pd                      # noqa: E402
 
@@ -143,6 +144,65 @@ def fig_per_code() -> None:
     plt.close(fig)
 
 
+# The three seeds of the shipped transformer, as re-fitted with wandb on by
+# `src.log_shipped_run` (which verified the refit reproduces the shipped matrix).
+# Their entries are the only ones for these run ids that carry `val_loss`: the
+# field was added for that refit, so filtering on it excludes the original fit.
+SHIPPED_TX_RUNS = ("P4_seed300_90b58acf", "P4_seed301_4f9084f7", "P4_seed302_ae43dae1")
+
+
+def fig_training_curves() -> None:
+    """Training and validation curves of the shipped transformer, per seed.
+
+    Read from ``outputs/metrics.jsonl`` -- the source of truth, and the same
+    per-epoch rows wandb received -- so the figure is reproducible offline.
+    """
+    rows = [json.loads(line) for line in
+            Path("outputs/metrics.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    df = pd.DataFrame([r for r in rows
+                       if r.get("run") in SHIPPED_TX_RUNS and "val_loss" in r])
+    if df.empty:
+        print("  training_curves: no logged refit in outputs/metrics.jsonl -- skipped")
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(10.5, 3.0))
+    colours = (ACCENT, WARN, "#4a7a3a")
+    for (run, g), c in zip(df.groupby("run", sort=True), colours):
+        g = g.sort_values("epoch")
+        seed = run.split("_")[1].replace("seed", "")
+        # Replay the training loop's own rule, not argmax: an epoch counts as an
+        # improvement only if it beats the best by more than min_delta = 0.002.
+        # argmax would mark seed 300 at epoch 9; the loop selected epoch 6.
+        best, best_ap = 0, -1.0
+        for ep, ap_ in zip(g.epoch, g.macro_ap):
+            if ap_ > best_ap + 0.002:
+                best, best_ap = int(ep), ap_
+        axes[0].plot(g.epoch, g.loss, "-", color=c, lw=1.5, label=f"train, seed {seed}")
+        axes[0].plot(g.epoch, g.val_loss, "--", color=c, lw=1.5, label=f"val, seed {seed}")
+        axes[1].plot(g.epoch, g.macro_auroc, "o-", color=c, lw=1.4, ms=3)
+        axes[2].plot(g.epoch, g.macro_ap, "o-", color=c, lw=1.4, ms=3, label=f"seed {seed}")
+        for ax in axes:
+            ax.axvline(best, color=c, lw=0.8, alpha=0.35)
+    axes[0].set_title("Masked BCE loss (solid train, dashed val)")
+    axes[0].set_ylabel("loss")
+    # Epoch 1's training loss (~0.38) is the average over a randomly initialised
+    # model; left in view it flattens everything that matters into the bottom sixth.
+    axes[0].set_ylim(0.08, 0.20)
+    axes[1].set_title("Validation macro AUROC")
+    axes[2].set_title("Validation macro AP")
+    axes[2].legend(frameon=False, fontsize=7)
+    for ax in axes:
+        ax.set_xlabel("epoch")
+        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+        ax.grid(alpha=0.25, lw=0.6)
+    fig.suptitle("Shipped transformer, three seeds (wandb group shipped-transformer)."
+                 "  Thin vertical line: epoch selected by early stopping.",
+                 fontsize=9, fontweight="600", y=1.04)
+    fig.tight_layout()
+    fig.savefig(OUT / "training_curves.png")
+    plt.close(fig)
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     ex = _load()
@@ -150,6 +210,7 @@ def main() -> None:
     fig_domain_shift(ex)
     fig_blocks_and_strides(ex)
     fig_per_code()
+    fig_training_curves()
     made = sorted(OUT.glob("*.png"))
     for f in made:
         print(f"  {f}  ({f.stat().st_size:,} bytes)")

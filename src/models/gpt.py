@@ -139,6 +139,20 @@ class GPTConfig:
     model exactly: no parameters are created and ``mix`` keeps its width.
     """
 
+    use_reason_embedding: bool = False
+    """Concatenate a learned embedding of each event's REASONCODE into ``mix``.
+
+    Synthea records what a drug, procedure, encounter or care plan was FOR on
+    25% of pre-anchor events. The token stream dropped it, so nothing linked
+    "metformin" to "prediabetes". One row per reason seen in >= 5 training
+    patients, plus row 0 = no reason (held at zero, so the 75% of events
+    without one add nothing) and row 1 = unseen reason. Measured caveat: 92.6%
+    of reasons are already a COND token by that day, so the new information is
+    the link, not the condition -- and at one layer the anchor sums events, so
+    the link is only weakly bound (§E56).
+    """
+    n_reasons: int = 0
+
     causal: bool = True
     """Causal (each position sees only the past) or bidirectional.
 
@@ -274,6 +288,11 @@ class PatientTransformer(nn.Module):
                     if cfg.use_age_encoding else None)
         # Concatenate-then-project. See module docstring for why not summing.
         n_in = cfg.n_embd + cfg.d_time * (2 if cfg.use_age_encoding else 1)
+        self.reason = None
+        if cfg.use_reason_embedding:
+            assert cfg.n_reasons >= 2, "n_reasons must include [NO_REASON] and [UNK_REASON]"
+            self.reason = nn.Embedding(cfg.n_reasons, cfg.n_embd, padding_idx=0)
+            n_in += cfg.n_embd
         self.mix = nn.Linear(n_in, cfg.n_embd, bias=False)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.ln_f = nn.LayerNorm(cfg.n_embd)
@@ -308,6 +327,11 @@ class PatientTransformer(nn.Module):
             persistent=False)
 
         self.apply(self._init)
+        # `_init` re-draws every embedding row, including padding rows. Row 0 of
+        # the reason table means "no reason" and must contribute nothing.
+        if self.reason is not None:
+            with torch.no_grad():
+                self.reason.weight[0].zero_()
         for n, p in self.named_parameters():           # nanoGPT scaled residual init
             if n.endswith("proj.weight") or n.endswith("mlp.2.weight"):
                 nn.init.normal_(p, std=0.02 / math.sqrt(2 * cfg.n_layer))
@@ -373,7 +397,8 @@ class PatientTransformer(nn.Module):
     def encode(self, tokens: torch.Tensor, dt: torch.Tensor,
                strict: bool = False, causal: bool | None = None,
                inject: tuple[int, torch.Tensor] | None = None,
-               age0: torch.Tensor | None = None) -> torch.Tensor:
+               age0: torch.Tensor | None = None,
+               reasons: torch.Tensor | None = None) -> torch.Tensor:
         pad = tokens != 0
         t = self.time(dt)
         if not self.cfg.use_time_encoding:
@@ -384,6 +409,10 @@ class PatientTransformer(nn.Module):
             # model that "has" age encoding and never sees one.
             assert age0 is not None, "use_age_encoding=True needs age0 (days at cutoff)"
             parts.append(self.age(age0.to(dt.dtype).unsqueeze(1) - dt))
+        if self.reason is not None:
+            assert reasons is not None, "use_reason_embedding=True needs reasons"
+            assert reasons.shape == tokens.shape, (reasons.shape, tokens.shape)
+            parts.append(self.reason(reasons))
         x = self.mix(torch.cat(parts, dim=-1))
         if inject is not None:                # replace a position's embedding
             pos, vec = inject
@@ -396,7 +425,8 @@ class PatientTransformer(nn.Module):
     def forward(self, tokens: torch.Tensor, dt: torch.Tensor,
                 lengths: torch.Tensor,
                 features: torch.Tensor | None = None,
-                age0: torch.Tensor | None = None) -> torch.Tensor:
+                age0: torch.Tensor | None = None,
+                reasons: torch.Tensor | None = None) -> torch.Tensor:
         """Logits per example, from whichever readout the mask implies."""
         # Applied once, HERE, rather than inside each fusion branch: both
         # `readout` and `token` consume `features` downstream, so dropping it at
@@ -436,10 +466,13 @@ class PatientTransformer(nn.Module):
             oldest = dt.max(dim=1, keepdim=True).values
             tokens = torch.cat([extra_tok, tokens], dim=1)
             dt = torch.cat([oldest, dt], dim=1)
+            if reasons is not None:
+                reasons = torch.cat([torch.zeros_like(reasons[:, :1]), reasons], dim=1)
             lengths = lengths + 1
-            h = self.encode(tokens, dt, strict=False, inject=(0, f), age0=age0)
+            h = self.encode(tokens, dt, strict=False, inject=(0, f), age0=age0,
+                            reasons=reasons)
         else:
-            h = self.encode(tokens, dt, strict=False, age0=age0)
+            h = self.encode(tokens, dt, strict=False, age0=age0, reasons=reasons)
 
         if self.cfg.readout == "mean":
             m = (tokens != 0).unsqueeze(-1).float()
@@ -452,7 +485,8 @@ class PatientTransformer(nn.Module):
         return self.head(pooled)
 
     def lm_forward(self, tokens: torch.Tensor, dt: torch.Tensor,
-                   age0: torch.Tensor | None = None) -> torch.Tensor:
+                   age0: torch.Tensor | None = None,
+                   reasons: torch.Tensor | None = None) -> torch.Tensor:
         """Next-token logits for pretraining, under the strictly-earlier mask.
 
         Forced causal regardless of ``cfg.causal``: with a bidirectional mask
@@ -460,10 +494,11 @@ class PatientTransformer(nn.Module):
         bidirectional arms pretrain with :meth:`mlm_forward` instead.
         """
         return self.lm_head(self.encode(tokens, dt, strict=True, causal=True,
-                                        age0=age0))
+                                        age0=age0, reasons=reasons))
 
     def mlm_forward(self, tokens: torch.Tensor, dt: torch.Tensor,
-                    age0: torch.Tensor | None = None) -> torch.Tensor:
+                    age0: torch.Tensor | None = None,
+                    reasons: torch.Tensor | None = None) -> torch.Tensor:
         """Masked-token logits, the bidirectional pretraining objective.
 
         Caller replaces a sample of positions with ``[MASK]`` and scores only
@@ -471,7 +506,7 @@ class PatientTransformer(nn.Module):
         side only is next-token prediction with fewer signals per pass.
         """
         return self.lm_head(self.encode(tokens, dt, strict=False, causal=False,
-                                        age0=age0))
+                                        age0=age0, reasons=reasons))
 
     def n_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

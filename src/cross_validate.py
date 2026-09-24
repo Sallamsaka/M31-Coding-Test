@@ -103,7 +103,8 @@ TRANSFORMER_CFG = dict(n_layer=1, n_embd=64, n_head=2, lr=0.0012,
 TRANSFORMER_SEEDS = (300, 301, 302)
 
 
-def _fit_transformer(root, fit_rows, ex_cfg, y_shape, verbose=False):
+def _fit_transformer(root, fit_rows, ex_cfg, y_shape, verbose=False,
+                     overrides=None, seeds=None):
     """Train on this fold's patients and return full-cohort probabilities.
 
     Seed-averaged over three runs in logit space. That is not a refinement: on
@@ -113,7 +114,13 @@ def _fit_transformer(root, fit_rows, ex_cfg, y_shape, verbose=False):
 
     `fold_pids` restricts training to the fold; `predict_all` returns every
     cohort row so the out-of-fold slice can be taken here.
+
+    `overrides` / `seeds` exist for `src.tx_sweep`, which varies one field at a
+    time against this recipe. Both default to the shipped recipe, so every
+    existing caller (run_baseline, run_cv, log_shipped_run) is unchanged.
     """
+    seeds = tuple(seeds) if seeds is not None else TRANSFORMER_SEEDS
+    tx_cfg = dict(TRANSFORMER_CFG, **(overrides or {}))
     import numpy as _np
 
     from .data.examples import ExampleConfig as _EC
@@ -126,17 +133,17 @@ def _fit_transformer(root, fit_rows, ex_cfg, y_shape, verbose=False):
     lg = lambda q: _np.log(_np.clip(q, 1e-6, 1 - 1e-6)
                            / (1 - _np.clip(q, 1e-6, 1 - 1e-6)))
     acc = None
-    for sd in TRANSFORMER_SEEDS:
+    for sd in seeds:
         cfg = TrainConfig(seed=sd, dev_frac=0.0, holdout_frac=0.0, epochs=30,
                           patience=4, min_delta=0.002, predict_all=True,
-                          **TRANSFORMER_CFG)
+                          **tx_cfg)
         res = train("P4", root, cfg, ex_cfg or _EC(), SeqConfig(),
                     verbose=verbose, fold_pids=fold_pids)
         P = res.get("all_preds")
         if P is None:
             raise RuntimeError("predict_all returned nothing")
         acc = lg(P) if acc is None else acc + lg(P)
-    return (1.0 / (1.0 + _np.exp(-acc / len(TRANSFORMER_SEEDS)))).astype("float32")
+    return (1.0 / (1.0 + _np.exp(-acc / len(seeds)))).astype("float32")
 
 
 

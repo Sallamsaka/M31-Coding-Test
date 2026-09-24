@@ -148,7 +148,7 @@ def fig_per_code() -> None:
 # `src.log_shipped_run` (which verified the refit reproduces the shipped matrix).
 # Their entries are the only ones for these run ids that carry `val_loss`: the
 # field was added for that refit, so filtering on it excludes the original fit.
-SHIPPED_TX_RUNS = ("P4_seed300_90b58acf", "P4_seed301_4f9084f7", "P4_seed302_ae43dae1")
+SHIPPED_TX_RUNS = ("P4_seed300_5221b458", "P4_seed301_07316ad3", "P4_seed302_08149c73")
 
 
 def fig_training_curves() -> None:
@@ -162,6 +162,11 @@ def fig_training_curves() -> None:
             if line.strip()]
     df = pd.DataFrame([r for r in rows
                        if r.get("run") in SHIPPED_TX_RUNS and "val_loss" in r])
+    # The final fit and the wandb refit log under the same run id (same config,
+    # same seed; the refit is verified bit-identical). Keep one row per epoch --
+    # the latest -- so two runs can never be drawn as one zig-zagging line.
+    if not df.empty:
+        df = df.drop_duplicates(["run", "epoch"], keep="last")
     if df.empty:
         print("  training_curves: no logged refit in outputs/metrics.jsonl -- skipped")
         return
@@ -195,7 +200,7 @@ def fig_training_curves() -> None:
         ax.set_xlabel("epoch")
         ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
         ax.grid(alpha=0.25, lw=0.6)
-    fig.suptitle("Shipped transformer, three seeds (wandb group shipped-transformer)."
+    fig.suptitle("Shipped transformer, three seeds (wandb group shipped-transformer-age)."
                  "  Thin vertical line: epoch selected by early stopping.",
                  fontsize=9, fontweight="600", y=1.04)
     fig.tight_layout()

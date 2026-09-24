@@ -120,7 +120,11 @@ def _fit_transformer(root, fit_rows, ex_cfg, y_shape, verbose=False,
     existing caller (run_baseline, run_cv, log_shipped_run) is unchanged.
     """
     seeds = tuple(seeds) if seeds is not None else TRANSFORMER_SEEDS
-    tx_cfg = dict(TRANSFORMER_CFG, **(overrides or {}))
+    # Keys prefixed "seq__" configure the SeqConfig (vocabulary / sequence
+    # construction); everything else is a TrainConfig field.
+    _over = dict(overrides or {})
+    seq_over = {k[5:]: _over.pop(k) for k in list(_over) if k.startswith("seq__")}
+    tx_cfg = dict(TRANSFORMER_CFG, **_over)
     import numpy as _np
 
     from .data.examples import ExampleConfig as _EC
@@ -137,7 +141,7 @@ def _fit_transformer(root, fit_rows, ex_cfg, y_shape, verbose=False,
         cfg = TrainConfig(seed=sd, dev_frac=0.0, holdout_frac=0.0, epochs=30,
                           patience=4, min_delta=0.002, predict_all=True,
                           **tx_cfg)
-        res = train("P4", root, cfg, ex_cfg or _EC(), SeqConfig(),
+        res = train("P4", root, cfg, ex_cfg or _EC(), SeqConfig(**seq_over),
                     verbose=verbose, fold_pids=fold_pids)
         P = res.get("all_preds")
         if P is None:

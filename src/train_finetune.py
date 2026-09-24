@@ -840,6 +840,11 @@ def train(arm: str = "P4", root: str | Path = ".", cfg: TrainConfig | None = Non
     _ek = ("" if ex_cfg == _default_ex
            else __import__("hashlib").sha256(
                repr(asdict(ex_cfg)).encode()).hexdigest()[:12])
+    if getattr(seq_cfg, "adaptive_bins", False):
+        # A different vocabulary construction must never share a checkpoint slot
+        # with the default one. vocab_size would usually differ, but "usually"
+        # is how D26 happened.
+        _ek = f"{_ek}|adaptive"
     fingerprint = _config_fingerprint(cfg, arm, len(vocab),
                                       seq_cfg.block_size, _fk, _ek)
 

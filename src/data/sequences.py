@@ -71,6 +71,16 @@ class SeqConfig:
     min_patients_per_code: int = 5
     n_value_bins: int = 10
     fuse_min_events_per_bin: int = 50   # below this, fall back to a shared Q token
+    adaptive_bins: bool = False
+    """Fuse EVERY numeric lab, with as many levels as its volume supports.
+
+    Off (default): a lab gets 10 fused tokens only if it has >= 50 events per
+    level; rarer labs emit the plain code plus a SHARED `Q0..Q9` token as a
+    second position. At one layer nothing binds that shared level to its lab
+    (§E56.6), so the value is effectively orphaned.
+    On: each lab gets clamp(n_events // 50, 2, 10) levels, all fused, so every
+    numeric event is one position and its level is never separated from it.
+    """
     kinds: tuple[str, ...] = ("ENC", "COND", "MED", "PROC", "OBS", "IMM",
                               "CP", "ALG", "DEV", "IMG")
 
@@ -181,6 +191,14 @@ def build_vocab(root: Path | str = ".", cfg: SeqConfig | None = None,
     counts = num.groupby("token", observed=True).size()
     edges, fused = {}, set()
     for tok, n in counts.items():
+        if cfg.adaptive_bins:
+            _nb = int(min(cfg.n_value_bins, max(2, n // cfg.fuse_min_events_per_bin)))
+            e = _decile_edges(num.loc[num.token == tok, "value"].to_numpy(), _nb)
+            if len(e) < 1:
+                continue                               # constant: no level at all
+            edges[tok] = e
+            fused.add(tok)
+            continue
         e = _decile_edges(num.loc[num.token == tok, "value"].to_numpy(), cfg.n_value_bins)
         if len(e) < 2:
             continue                                   # near-constant: no value token
@@ -221,6 +239,7 @@ def build_vocab(root: Path | str = ".", cfg: SeqConfig | None = None,
         "fit_pids_given": fit_pids is not None,
         "n_codes_kept": len(keep), "n_fused_codes": len(fused),
         "min_patients_per_code": cfg.min_patients_per_code,
+        "adaptive_bins": cfg.adaptive_bins,
     })
 
 
@@ -263,6 +282,9 @@ def build_sequences(root: Path | str = ".", vocab: Vocab | None = None,
         else:
             ids[i] = vocab.get(t, kind[i])
 
+    if vocab.meta.get("adaptive_bins"):
+        # The point of the flag: no numeric event may be split into two positions.
+        assert int((extra_q >= 0).sum()) == 0, "adaptive_bins emitted a shared Q token"
     pre["tid"], pre["qid"] = ids, extra_q
     _rs = pre.reason.astype(object)
     _known = _rs.map(vocab.reasons)

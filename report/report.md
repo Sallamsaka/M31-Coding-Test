@@ -7,8 +7,14 @@ after each patient's anchor date, from structured events recorded strictly
 before it. 3,514 patients, split 2,791 train / 365 validation / 358 test.
 
 > **Status.** All results below are measured and reproducible via
-> `run_all.ps1`. The two pretrained transformer arms (P1, P2) are implemented
-> and smoke-verified but not trained; see §2.
+> `run_all.ps1`. Code: [github.com/Sallamsaka/M31-Coding-Test](https://github.com/Sallamsaka/M31-Coding-Test) ·
+> model: [huggingface.co/sallamsaka/M31-Coding-Test](https://huggingface.co/sallamsaka/M31-Coding-Test) ·
+> training curves: [wandb project m31-patient-timeline](https://wandb.ai/sallamsaka-university-of-toronto/m31-patient-timeline) (§2).
+> The recommended pretraining (causal, next-event) was trained and measured; see §2.
+>
+> **Test-set metrics are not reported because they cannot be computed here:** the
+> test outcomes are withheld by design. Macro AUROC and macro AP are reported on
+> the provided validation set and on cross-validated out-of-fold predictions.
 
 ---
 
@@ -21,7 +27,7 @@ before it. 3,514 patients, split 2,791 train / 365 validation / 358 test.
 | **Prevalence-only control** | exactly 0.5000 — the metric code is correct |
 | **Resolution limit of this validation set** | ±0.01 macro AUROC |
 | **Model shipped** | `sigmoid((logit(LR)+logit(GBDT)+logit(transformer))/3)`, per-label Platt calibrated — chosen on **1,675 out-of-fold rows**, not on validation |
-| **Automated checks** | 130+, covering leakage, labels, submission contract, model invariants, cache-key provenance and calibration no-op |
+| **Automated checks** | 150, covering leakage, labels, submission contract, model invariants, cache-key provenance and calibration no-op |
 
 Four findings I would put ahead of the score — including one about whether
 the score can distinguish anything at all:
@@ -114,10 +120,13 @@ So position indices are not emitted at all. Instead:
   content vector against a time vector through one shared projection.
   CEHR-BERT ran the controlled version: summing time was *worse than injecting
   no time at all* in 7 of 8 task-metric cells.
-- a **pairwise Δt bias** on the attention logits, 32 log-spaced buckets, ~192
-  parameters. Bucket 0 is reserved for exactly-simultaneous, because the
-  smallest non-zero gap measured here is 55 seconds and 7.6% of consecutive
-  gaps fall inside bucket 1 alone.
+- a **pairwise Δt bias** on the attention logits: log-spaced buckets of the gap
+  between two events, one learned scalar per (head, bucket). First built with
+  32 buckets (copied from T5), cut to **10** (2 heads × 10 = **20 parameters**)
+  after measured occupancy showed the resolution in the wrong place. Bucket 0 is
+  reserved for exactly-simultaneous, because the smallest non-zero gap measured
+  here is 55 seconds. **In the shipped model it is inert** — see "What the
+  shipped transformer actually uses" below.
 
 Explicit interval tokens were rejected: they cost 19.5% sequence length, and
 attention is O(T²), so that is 1.43× on the attention term for information the
@@ -150,6 +159,57 @@ never read** — both label boundaries are at midnight, and 119 first-diagnoses
 land exactly on `anchor + 5y`, so snapping one forward would push it past the
 closed right edge and silently delete a true positive. A grep test enforces
 the separation.
+
+### What the shipped transformer actually uses
+
+The design above was argued for a general decoder. The shipped model is small —
+**1 layer, width 64, 2 heads of 32, 561,404 parameters** (128,596 in the
+sequence trunk; 425,088 in the projection of the 3,320 tabular features; 7,720 in
+the 40-way head) — and reading its weights and tracing a real patient through
+every tensor by hand (matching the model's own output to 4.8e-07) shows which
+parts of the design it uses:
+
+- **Time enters only through Time2Vec.** In each event's input vector the time
+  part is on average **2.2× larger** than the token part (0.168 vs 0.075). Giving
+  every event the same Δt drops one head's attention on the most recent visit from
+  **97% to 9%**: recency is learned, and it is learned here. Time2Vec's own 128
+  parameters barely moved from initialisation (frequencies by at most 0.066); the
+  learning is in the projection that reads them.
+- **The Δt bias is inert.** Its 20 values stay within ±0.07 of zero, their signs
+  disagree across seeds, and zeroing it in all three shipped seeds moves validation
+  macro AUROC from 0.7650 to 0.7651 with AP unchanged.
+- **The causal mask is inert at one layer.** The prediction is read only at the
+  final `[ANCHOR]` position, which is the latest instant and so sees every event
+  under any mask; the other positions' outputs are never read. Switching the mask
+  off changes the output by exactly 0.0, and shuffling event order (each event
+  keeping its own time) by 5e-07. At one layer the model is attention-pooling over
+  a set of (event, time-before-anchor) pairs; an earlier ablation that credited
+  order to the mask was run at two layers and does not transfer.
+- **The two heads specialise.** Averaged over the 365 validation patients, head 1
+  puts 70% of its attention on labs and vitals and 63% on the last six months; head
+  2 spreads over drugs and visits and puts 27% on events more than ten years old.
+- **The tabular features outweigh the sequence at the output** — mean contribution
+  to the 40 logits 1.86 from the feature projection against 0.80 from the sequence.
+
+Four representation gaps surfaced the same way, none of them fixed in the shipped
+model:
+
+- **Text-valued results lose their value.** Only numeric observations get a level;
+  7.3% of observation rows are text — smoking status (never 25,584 / former 16,175 /
+  current 72 rows) and the urinalysis panel — and every model sees only that the
+  assessment happened.
+- **The sequence carries no age.** The header has sex, race, ethnicity and marital
+  status; Δt is time before the anchor. Age reaches the transformer once, as a
+  feature at the readout.
+- **Rare-lab values are orphaned at one layer.** An unfused lab is two positions
+  (the code, then a shared level token), and with one layer nothing ties the level
+  to its lab.
+- **Nothing links a drug to the condition it treats**, although Synthea records a
+  reason on 25% of pre-anchor events.
+
+The optional genomics and imaging modalities were not used: the brief states the
+structured tables are sufficient, and every result here is data-limited by patient
+count (§4), which neither modality changes.
 
 ### Five feature blocks that changed nothing, reported anyway
 
@@ -346,63 +406,12 @@ about as well as the feature model and is markedly worse at the top, which is
 where the rare-condition positives live. A plausible mechanism, untested: the
 feature model gets 40 explicit per-condition count blocks and fits 40
 independent classifiers over them, while the transformer must serve 40 heads
-from one shared 192-dimensional summary. With a median of 11 validation
+from one shared 192-dimensional summary (the untuned model; the tuned one uses
+64, plus a 128-wide projection of the same features). With a median of 11 validation
 positives per label, the shared trunk has little to learn each head from.
 This is what the literature predicts at this scale, and it is the second
 independent sign — after the learning curve — that the binding constraint
 here is data rather than architecture.
-
-### Why the two pretraining arms were built and deliberately not run
-
-P1 (causal + next-token) and P2 (bidirectional + masked-token) are implemented
-and verified end-to-end on a smoke run. They were not trained, and that is a
-decision rather than a budget accident — the cost is ~8 CPU-hours, which is
-affordable against a 19-minute GBDT fold if the expected value justified it.
-Three independent lines say it does not:
-
-**The corpus is an order of magnitude too small.** There is no external EHR
-corpus here, so "pretraining" means self-pretraining on the same 2,791
-patients — roughly **0.8M tokens**, against BabyLM's smallest track at **10M
-words**. Nothing in the pretraining literature shows gains below that floor.
-
-**The result that motivated it is a transfer result, not a pretraining result.**
-The first draft made the transformer the centrepiece on Med-BERT's small-cohort
-curve. That curve is bought with **28.5M pretraining patients** and then
-transferred; below n=500 Med-BERT itself loses to logistic regression. We have
-nothing to transfer *from*, which is the part of the setup that produced the
-curve.
-
-**The nearest published head-to-head goes the other way.** On EHRSHOT's
-"Assignment of New Diagnoses" — this exact task family, at 793–1,392 training
-patients — a **141M-parameter model pretrained on 2.57M patients scores 0.707
-against counts+LightGBM at 0.719**. Pretraining at a scale we cannot reach did
-not win this task family.
-
-And the protocol itself has a measured null on a comparable corpus: **+0.006
-AUC, p = 0.63**.
-
-The deeper reason is that pretraining does not address the binding constraint.
-The learning curve (§4) is **still rising at full data**, so this model is
-limited by *patients*. Self-pretraining re-reads the patients we already have;
-it adds none. That is the same reason cutoff augmentation failed — it adds
-rows, not patients — and it is measured, not assumed.
-
-What was done instead: the arms exist and run end-to-end, and the objectives are
-verified by test rather than by inspection — `lm_forward` is shown to be causal
-even on a bidirectional model, the next-token objective is shown not to see the
-token it predicts, and the masked objective is shown to score only the masked
-positions and to start at a loss of 6.74 against `ln(1105) = 7.01`, i.e. not
-leaking its target.
-
-**What is *not* guarded, stated plainly because an earlier draft of this report
-claimed otherwise:** nothing at runtime stops a mislabelled run. `--arm P1` with
-`pretrain_epochs=0` executes the pretraining loop zero times and produces a run
-labelled P1 that is numerically P4, and nothing raises. The arm table is checked
-against `configs/default.yaml` by a test, and the objectives are checked by
-tests, but the *run* is not. That is a gap, not a feature.
-
-Running them remains worthwhile for exactly one reason: a pre-registered null is
-a result, and this one is pre-registered at ~65% confidence it will not resolve.
 
 Two caveats on that table, both of which matter more than the ordering.
 
@@ -440,6 +449,82 @@ either metric. The ensemble genuinely beats both (ENS−GBDT AUROC +0.0055
 [+0.0006, +0.0107]; ENS−LR AP +0.0226 [+0.0008, +0.0433]), and Spearman
 correlation between their per-label scores is 0.740, so they fail on different
 patients and the averaging is not redundant.
+
+### Training and validation curves (wandb)
+
+The shipped transformer was re-fitted with tracking on, through the same function
+the submission pipeline calls, and the three seeds are logged in the
+[wandb project](https://wandb.ai/sallamsaka-university-of-toronto/m31-patient-timeline)
+(group `shipped-transformer`):
+[seed 300](https://wandb.ai/sallamsaka-university-of-toronto/m31-patient-timeline/runs/iie7bkcq) ·
+[seed 301](https://wandb.ai/sallamsaka-university-of-toronto/m31-patient-timeline/runs/8env00qn) ·
+[seed 302](https://wandb.ai/sallamsaka-university-of-toronto/m31-patient-timeline/runs/3gltdo95).
+The logged runs **are** the submitted model, not a lookalike: the re-fit's
+prediction matrix matches the shipped one to a maximum absolute difference of
+3.4e-05 (mean 1.3e-07).
+
+![Training and validation curves](../outputs/figures/training_curves.png)
+
+Per epoch: the training loss, the same at-risk-masked cross-entropy on the
+validation set, and validation macro AUROC and AP. Early stopping (patience 4 on
+validation AP, improvements under 0.002 not counted) selected epochs 6, 10 and 8.
+Validation loss bottoms out around epoch 5–6 and then rises (seed 301: 0.160 at
+its selected epoch, 0.171 at the last) while training loss keeps falling (0.110 →
+0.088) and validation AP flattens — the overfitting pattern measured
+separately in the tuning programme, where running an earlier configuration to 30
+epochs instead of stopping cost 0.022 AP.
+
+Optimisation: masked binary cross-entropy (prevalent pairs contribute nothing),
+AdamW at 1.2e-3 with linear warm-up over the first 5% of steps and cosine decay,
+weight decay 0.001, no dropout, batch 32 (length-bucketed), three seeds averaged
+in logit space (worth +0.013 AP).
+
+### Pretraining, as the brief recommends: trained, and measured
+
+The brief suggests a decoder-only transformer pretrained on next-event prediction
+and then fine-tuned. That is arm P1, and it was trained at the shipped
+architecture — three seeds, trained on four cross-validation folds, scored on the
+fifth, each paired against the identical configuration without the warm-up. The
+pretraining corpus is the pre-anchor events of training patients only.
+
+**The warm-up trains.** Next-event loss falls from 6.20 to about 2.95 over 8
+epochs, against `ln(1105) = 7.01` for a uniform guess. It cost 23 minutes, not the
+~8 CPU-hours an earlier estimate (for a 2M-parameter model) assumed.
+
+**End to end, it changes nothing measurable:** macro AP −0.0015 [−0.0339, +0.0309],
+macro AUROC +0.0009 [−0.0086, +0.0103], signs mixed across seeds. Pre-registered
+before the run at ~65% confidence, on the corpus argument: ~0.8M tokens against
+BabyLM's smallest 10M-word track, and no external corpus to transfer from.
+
+**But it is not because nothing was learned.** A linear probe separates the two
+explanations. Freezing the trunk and fitting only a per-condition linear classifier
+on its 64-dimensional summary (tabular features excluded):
+
+| frozen trunk | macro AP | macro AUROC |
+|---|---|---|
+| random initialisation | 0.0996 | 0.6196 |
+| **pretrained** | **0.1120** | **0.6514** |
+| fine-tuned from random (for scale) | 0.2241 | — |
+
+The pretrained representation carries real task information (+0.0124 AP, +0.0318
+AUROC, both seeds agreeing). Supervised fine-tuning is worth ten times as much
+(+0.1245) and reaches the same place from either start: models stopped at epochs
+8/9/10 pretrained against 8/9/11 cold, where a useful head start should converge
+sooner. **What the next-event objective learns, 2,233 labelled patients teach
+anyway.**
+
+**Protecting it makes it worse.** Slowing the trunk to 10% of the learning rate
+during fine-tuning moves AP −0.0094 and AUROC −0.0015 — neither resolvable, both
+the wrong direction. The pretrained start is better than random and worse than
+what 6–8 epochs of supervision build.
+
+The mechanism is the binding constraint: the learning curve (§4) is still rising
+at full data, so the model is limited by **patients**, and self-pretraining re-reads
+the patients it already has. One variant remains untested and is the only one with
+a mechanism for a larger effect: the warm-up used only the **935,483 pre-anchor**
+events of training patients, while their **955,228 post-anchor** events — legal to
+use for training patients, and exactly the dynamics the task asks about — were
+never seen (§5).
 
 ### Where the score actually comes from
 
@@ -511,6 +596,20 @@ width 128 completes 20 epochs in **14 minutes** against 63 for the shipped
 4-layer, width-192 model. That is a 4.5× discount, and not only a proxy — the
 EHR literature places the depth optimum at one or two layers, so the
 screening size is a live candidate in its own right.
+
+**What this did and did not settle about depth and heads — stated because it is
+easy to overstate.** The greedy search's final stage re-ran depth with every later
+choice in place, and **two layers beat one** (dev AP 0.2144 against 0.2042) — one
+seed, 558 dev patients, about 0.6σ, and with the one-layer runs still improving at
+the epoch cap. The later factorial design then varied depth only inside a joint
+"capacity" factor — (1 layer, width 64, 2 heads) against (2, 128, 4) — and a
+re-test at the tuned learning rate put the larger setting at −0.0087 AP (three
+of three seeds negative), with 2.4× the fit time. The shipped model is the small
+setting. So "small beats large" is measured; **"one layer beats two" and "two
+heads beat four" are not**, because neither was ever varied alone. That matters
+more than it would for a generic model: three of the representation gaps in §1
+(the inert mask, orphaned rare-lab levels, and drug↔reason links) are specifically
+one-layer limitations.
 
 ### What the validation set can and cannot resolve
 
@@ -629,6 +728,21 @@ crash, and not the ones that produce absurd numbers — the ones that produce
 *slightly disappointing* numbers, because those get explained away as "the
 model is weak on rare labels" and shipped.
 
+**The last session found more than the previous five, by explaining the model
+to a person.** I asked the assistant to walk me through the representation and
+architecture in depth, and kept rejecting explanations that described rather than
+showed. To answer precisely it had to trace a real patient through every tensor
+of the shipped weights, and four of its own confident claims failed on contact:
+the parameter count (it had repeated 334k; the shipped model is 561,404), the Δt
+bias (described as 32 buckets and working; it is 10 buckets and inert), the role
+of the causal mask (quoted from a two-layer ablation; at one layer it does
+nothing), and "one layer is optimal" (never tested alone; an earlier search
+favoured two). The same pass found the representation gaps in §1. My pushback
+also caught a method error: it proposed screening transformer ideas with
+logistic regression, which cannot see sequence effects at all. The workflow
+lesson is the same as the bugs': explanations asserted from memory drift, and
+the cheapest audit is to make the claim reproduce a number from the artifact.
+
 **What AI assistance was good and bad at.** Good: breadth of literature recall,
 generating the adversarial checks (the trap-pair test for recurring diagnoses,
 the non-vacuity guards, the permutation invariance assertion), and writing
@@ -731,6 +845,34 @@ and 7× sparser (median 26 pre-cutoff events vs 189), and the 40 targets are
 adult-onset conditions. The untested variant — train broad, then fine-tune on
 real cutoffs only — is a different proposition from pooling and remains open.
 
+### What the transformer looks at: one patient, traced
+
+Patient 66 (training split) is a 59-year-old man with 104 positions of history:
+a 1930 sinusitis, a 1958 obesity finding, annual check-ups from 1969 with the
+standard vitals and a lipid panel, an ankle fracture in 1971 (ER visit, X-ray,
+aspirin, a bone-density scan), and a last check-up 99 days before his anchor.
+
+Both attention heads put almost everything on that last check-up. Head 1: height
+25.8%, systolic blood pressure 22.1%, total cholesterol 15.8%, HDL 11.1%. Head 2:
+total cholesterol 22.5%, LDL 11.3%, systolic BP 10.3%, triglycerides 8.7%. The
+fracture and the old diagnoses receive almost none. Across all 365 validation
+patients the same split holds: head 1 is a recent-labs head (63% of its attention
+within six months), head 2 a long-history head (27% on events over ten years old).
+
+He was at risk for 37 of the 40 conditions and developed 5 of them. The model's
+top five at-risk predictions contain four: viral sinusitis (0.549), neoplasm of
+prostate (0.492), carcinoma in situ of prostate (0.439), metastasis from prostate
+cancer (0.378); the fifth, chronic congestive heart failure (0.413), did not occur.
+This is the pattern the per-condition table shows at scale: sex- and age-gated
+Synthea modules (the prostate trio) are close to deterministic once a model knows
+a man is entering his sixties. Where that knowledge comes from is only partly
+traced: the attention weights say what the *sequence* side reads (his latest
+vitals), but the tabular features — which carry sex and age explicitly — move the
+40 output logits more than twice as much as the sequence summary does (mean
+contribution 1.86 against 0.80), so the prostate predictions most likely lean on
+them. Attributing an individual prediction properly would need an attribution
+method, not attention weights.
+
 ### Near-duplicate labels mean there are not 40 problems
 
 Six label pairs correlate above φ = 0.85. `Abnormal gait` and `silent
@@ -773,8 +915,9 @@ sets, so the numbers are held out, not in-sample:
 rate moves from 0.67× observed to **0.83×**.
 
 This is the only change available that *cannot lose* on the metrics being
-optimised while improving every proper scoring rule — which matters because the
-grading metric is not stated anywhere in the brief. It is applied with a gate:
+optimised while improving every proper scoring rule. The brief asks for macro
+AUROC and mAP, both rank statistics, so calibration costs nothing on either and
+makes the submitted probabilities mean what they say. It is applied with a gate:
 `run_baseline` re-verifies the no-op at ship time and refuses the calibration,
 shipping raw scores, if any rank metric moves by more than 1e-9.
 
@@ -792,57 +935,48 @@ synthetic-trained models in only **21–26%** of cases.
 
 ## 5. What I would do next, in order
 
-**1. Fix the evaluation before adding any model.** Every difference measured
-here is smaller than the winner's-curse bound on the number of times the
-validation set was consulted. Adding a sixth model to a 365-patient holdout
-buys a number, not an answer. The fix is repeated grouped cross-validation
-over the 2,791 training patients: `√(2791/365) = 2.8×` tighter standard
-errors, at zero cost to the validation budget, and the grouping machinery
-already exists (`examples.grouped_folds`). This is the highest-value item by
-a wide margin and it is not a modelling change.
+Two items that led earlier versions of this list are done: grouped
+cross-validation replaced validation as the selection instrument (§0), and seed
+variance is measured (three seeds per configuration; averaging them is worth
++0.013 AP). What remains, ranked by expected value per hour:
 
-**2. Seed variance.** Three seeds of one configuration. Without the spread,
-no transformer-versus-baseline difference can be called real — this is the
-largest concrete gap in the current results, and it is four hours of CPU.
+**1. A second layer, varied alone.** The only architecture question with a
+plausible effect this instrument could see. Depth was only ever varied jointly
+with width and heads (§2), and three of the representation gaps in §1 — the inert
+mask, orphaned rare-lab levels, unbound drug↔reason links — exist *because* the
+model has one layer. Tested overnight as part of the sweep below.
 
-**3. ~~The two pretraining arms.~~ DONE for P1 — a measured null.** Run at the
-shipped config (not the 4L/d192 CLI default, which is the architecture this
-report abandons), three seeds, paired against the identical config without the
-warm-up: **macro AP −0.0015 [−0.0339, +0.0309], macro AUROC +0.0009 [−0.0086,
-+0.0103]**. Neither resolves and the signs are mixed.
+**2. Pretrain on whole training timelines.** The next-event warm-up saw only the
+935,483 pre-anchor events of training patients; their 955,228 post-anchor events
+are legal training data and are exactly the five-year dynamics being predicted.
+It still adds no patients, which is why the measured pretraining null (§2) may
+survive it — but it is the only pretraining variant with a mechanism for a larger
+effect. It needs after-anchor codes in the vocabulary, which nothing else does.
 
-The warm-up itself trained — next-token loss fell from 6.20 to 2.9 against
-`ln(1105) = 7.01` — so this is a transfer failure, not a broken run. That
-distinction is the whole value of having run it: the literature prediction
-(+0.006 AUC, p = 0.63 for this exact protocol) and the corpus argument (~0.8M
-tokens against BabyLM's 10M-word floor) are now supported by a measurement on
-this dataset rather than borrowed.
+**3. Encode each event completely at one layer.** Age at each event, the reason
+a drug was given, the answer of a text-valued observation, and every lab's level
+inside its own token instead of a second position. At one layer these must live
+inside the event's own vector, because nothing else can bind them together. The
+sweep below measures the first two; text answers were measured on the feature
+side and are slightly negative for LR (AUROC −0.0009 [−0.0016, −0.0002]).
 
-It also cost **23 minutes**, not the ~8 CPU-hours quoted throughout this report.
-That estimate was for the 2M-parameter default and was never re-derived for the
-334k-parameter model actually shipped — which is most of why it went unrun.
+**4. Death as an auxiliary training target.** §4's central finding is that the
+outcome window is often a patient's last five years. Death inside the window is a
+training-only label (legal as a *target*, forbidden as a feature) that a shared
+trunk could learn from. Untested.
 
-**P2 (bidirectional + masked-token) remains unrun**, deliberately: every tuned
-result here is causal (arm P4), `P4 − P3` = +0.0148 [−0.0033, +0.0318] favours
-causal, and pretraining an architecture that is neither tuned nor shipped would
-not inform the submission.
+**5. Staged training for the cutoff augmentation.** Naive pooling is settled and
+negative; train-broad-then-fine-tune-on-real-cutoffs is the one form the
+domain-shift diagnostic (§4) does not rule out.
 
-**4. Staged training for the cutoff augmentation.** Naive pooling is settled
-and negative. Train-broad-then-fine-tune-on-real-cutoffs is a different
-proposition and is the one form the domain-shift diagnostic does not rule
-out — the synthetic examples are demonstrably learnable, they simply describe
-a different conditional distribution, which is the situation transfer
-learning is for.
+**6. Confirm the null feature blocks on a tree.** `REASONCODE` and the
+age-residual blocks can only pay off through interactions a linear model cannot
+express, so their null on logistic regression is uninformative about them.
 
-**5. Confirm the feature blocks on a tree.** `REASONCODE` and the
-age-residual features can only pay off through interactions a linear model
-cannot express, so their null result on logistic regression is uninformative
-about them. One gradient-boosting run settles it.
-
-Notably absent: a bigger transformer. At 2,791 patients the binding
-constraint is data, not capacity, and every published crossover point for
-sequence models trained from scratch on their own cohort sits at roughly
-18,000 patients — 6.5× what we have.
+Notably absent: a much larger transformer. The only "larger" configuration tested
+cleanly lost (−0.0087 AP, three of three seeds), the model measurably overfits
+(validation loss turns up after epoch 5–6), and the learning curve says the
+binding constraint is patients.
 
 ---
 
@@ -861,6 +995,6 @@ it. The report itself renders to print-ready HTML with
 PDF from a browser.
 
 `predictions.csv` is written before any slow stage, so a valid submission
-exists even if a later stage fails. 63 automated checks run first, including a
+exists even if a later stage fails. 150 automated checks run first, including a
 grep test that no module outside the time utility parses a timestamp, and one
 that labels never read the ordering timestamp.

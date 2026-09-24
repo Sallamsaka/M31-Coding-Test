@@ -634,7 +634,7 @@ the repository before any comparison existed.
 | + reason-code embedding | −0.0028 [−0.0105, +0.0029] | −0.0037 [−0.0086, +0.0016] | no |
 | every lab fused into its token | +0.0023 [−0.0047, +0.0088] | −0.0032 [−0.0089, +0.0023] | no |
 | + text answers (smoking, urinalysis) | +0.0006 [−0.0067, +0.0075] | −0.0036 [−0.0089, +0.0020] | no |
-| 2 layers, on top of age (vs age alone) | −0.0016 [−0.0073, +0.0053] | −0.0042 [−0.0102, +0.0024] | no |
+| 2 layers, on top of age (vs age alone; **3 seeds**) | −0.0029 [−0.0076, +0.0019] | −0.0013 [−0.0048, +0.0024] | no |
 
 **Age at each event was then confirmed.** The confirmation re-ran the baseline and the
 age arm at two new seeds, which were never used to pick the winner, so it carries no
@@ -662,8 +662,11 @@ The nulls are informative too:
   of reasons are a diagnosis token by the same day.
 - **Labs and text answers.** Fusing every lab touches 0.76% of numeric events, and the
   text answers carry little signal — the feature-side test on LR was a tiny negative.
-- **A second layer.** It adds nothing on top of age, which settles the depth question
-  §2 left open, at least for this model.
+- **A second layer.** It adds nothing on top of age: −0.0029 AP and −0.0013 AUROC
+  on the transformer, −0.0008 and −0.0011 on the blend, over three seeds. That
+  settles the depth question §2 left open, at least for this model. Once age is
+  inside every event, the one-layer limitations in §1 no longer cost anything
+  measurable.
 
 **Not yet in the submission.** These results arrived after the submitted model was
 built. Swapping it in means re-running cross-validation, calibration, the final fit,

@@ -8,8 +8,8 @@ script never fails on a missing credential -- the upload is a delivery step,
 not a result, and a missing token should not invalidate a completed run.
 
 Nothing derived from validation or test labels is uploaded. The card reports
-validation metrics because they are model-selection output, which the brief
-permits; it does not ship the validation predictions themselves.
+5-fold cross-validation results on the training patients (the test outcomes
+are withheld).
 """
 
 from __future__ import annotations

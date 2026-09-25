@@ -208,6 +208,80 @@ def fig_training_curves() -> None:
     plt.close(fig)
 
 
+ACUTE = ("fracture", "sprain", "laceration", "whiplash", "concussion", "sinusitis",
+         "bronchitis", "pharyngitis", "sore throat")
+
+
+def fig_per_condition_cv() -> None:
+    """Per-condition AUROC of the submitted blend on the 5-fold test folds."""
+    p = Path("outputs/per_condition_cv.csv")
+    if not p.exists():
+        print("  per_condition_cv.csv absent -- skipped")
+        return
+    t = pd.read_csv(p).sort_values("auroc")
+    acute = t.name.str.lower().str.contains("|".join(ACUTE))
+    fig, ax = plt.subplots(figsize=(7.2, 7.4))
+    ax.barh(t.name.str.replace(r" \((disorder|finding|situation)\)", "", regex=True),
+            t.auroc - 0.5, left=0.5, height=0.7,
+            color=[WARN if a else ACCENT for a in acute])
+    ax.axvline(0.5, color=INK, lw=0.8)
+    ax.set_xlim(0.4, 1.0)
+    ax.set_xlabel("test-fold AUROC (5-fold CV, 2,791 training patients)")
+    ax.set_title("Chronic, age/sex-gated conditions vs random acute events (red)")
+    ax.tick_params(axis="y", labelsize=7)
+    ax.grid(axis="x", alpha=0.25, lw=0.6)
+    fig.savefig(OUT / "per_condition_cv.png")
+    plt.close(fig)
+
+
+def fig_time_attention() -> None:
+    """How strongly the trained transformer attends to one event by its age."""
+    import math
+    import torch
+    from .models.gpt import GPTConfig, PatientTransformer
+    ck = Path("artifacts/model_P4_seed300_5221b458.pt")
+    if not ck.exists():
+        print("  shipped seed-300 checkpoint absent -- skipped")
+        return
+    d = torch.load(ck, map_location="cpu", weights_only=False)
+    m = PatientTransformer(GPTConfig(**d["gpt_config"]))
+    m.load_state_dict(d["state_dict"]); m.eval()
+    itos = json.loads(Path("artifacts/vocab.json").read_text())["itos"]
+    stoi = {t: i for i, t in enumerate(itos)}
+    ev, an, age0 = stoi["OBS_8480-6_Q5"], stoi["[ANCHOR]"], 60 * 365.25
+    B = m.blocks[0]
+
+    def score(dt, head, line_only):
+        with torch.no_grad():
+            def vec(tok, t):
+                f = m.time(torch.tensor([[float(t)]]))
+                if line_only:
+                    f = f.clone(); f[..., 1:] = 0.0
+                return m.mix(torch.cat([m.tok(torch.tensor([[tok]])), f,
+                                        m.age(torch.tensor([[age0]]))], -1))
+            qa = (B.ln1(vec(an, 0)) @ B.qkv.weight.T)[..., :64]
+            ke = (B.ln1(vec(ev, dt)) @ B.qkv.weight.T)[..., 64:128]
+            s = slice(32 * head, 32 * head + 32)
+            return float((qa[..., s] * ke[..., s]).sum() / math.sqrt(32))
+
+    days = np.unique(np.round(np.logspace(0, 4, 60)))
+    fig, ax = plt.subplots(figsize=(6.0, 3.2))
+    for line_only, c, lab in ((False, ACCENT, "learned time encoding"),
+                              (True, MUTED, "straight-line term only")):
+        s = np.array([score(x, 1, line_only) for x in days])
+        ref = score(90, 1, line_only)
+        ax.plot(days, np.exp(s - ref), color=c, lw=1.8, label=lab)
+    ax.set_xscale("log")
+    ax.axhline(1.0, color=INK, lw=0.6, ls=":")
+    ax.set_xlabel("days between the event and the anchor (log scale)")
+    ax.set_ylabel("attention relative to 90 days")
+    ax.set_title("Head 2: how much one blood-pressure reading counts, by when it happened")
+    ax.legend(frameon=False, fontsize=8)
+    ax.grid(alpha=0.25, lw=0.6)
+    fig.savefig(OUT / "time_attention.png")
+    plt.close(fig)
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     ex = _load()

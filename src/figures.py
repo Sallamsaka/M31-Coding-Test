@@ -266,8 +266,7 @@ def fig_time_attention() -> None:
 
     days = np.unique(np.round(np.logspace(0, 4, 60)))
     fig, ax = plt.subplots(figsize=(6.0, 3.2))
-    for line_only, c, lab in ((False, ACCENT, "learned time encoding"),
-                              (True, MUTED, "straight-line term only")):
+    for line_only, c, lab in ((False, ACCENT, "learned time encoding"),):
         s = np.array([score(x, 1, line_only) for x in days])
         ref = score(90, 1, line_only)
         ax.plot(days, np.exp(s - ref), color=c, lw=1.8, label=lab)
@@ -276,7 +275,7 @@ def fig_time_attention() -> None:
     ax.set_xlabel("days between the event and the anchor (log scale)")
     ax.set_ylabel("attention relative to 90 days")
     ax.set_title("Head 2: how much one blood-pressure reading counts, by when it happened")
-    ax.legend(frameon=False, fontsize=8)
+
     ax.grid(alpha=0.25, lw=0.6)
     fig.savefig(OUT / "time_attention.png")
     plt.close(fig)

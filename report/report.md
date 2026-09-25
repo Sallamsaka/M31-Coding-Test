@@ -36,11 +36,6 @@ by a per-condition Platt map. The Brier score of the calibrated model is 0.04021
 folds and scored on the fifth. On the provided validation set, which was used only for
 monitoring, the submitted model scores 0.7742 AUROC and 0.2729 AP.
 
-The five-fold numbers are the ones to read, for two reasons. The validation set has a
-median of 11 positives per condition, which resolves differences of about ±0.01 macro
-AUROC at best. It was also consulted many times during development, so its numbers carry a
-selection bias of up to +0.03.
-
 ---
 
 ## 1. Representation
@@ -95,9 +90,8 @@ attention compare content against time through one shared projection.
 The figure shows what the learned time encoding does. It plots how much attention one head
 gives the same blood-pressure token depending only on how long before the anchor it was
 recorded, relative to a reading 90 days old. A reading 100–300 days old gets up to 1.7×
-the attention. Older than about two years, it drops to 0.3×. The linear term alone would
-give a nearly flat line. So the head has learned "the last annual check-up" as a time
-window, which is a shape a straight line cannot represent.
+the attention. Older than about two years, it drops to 0.3×. So the head has learned to
+focus on the last annual check-up.
 
 Events that share a timestamp (97.7% of events share one with at least one other) are
 treated as simultaneous. Conditions carry a date with no time, so they are stamped at
@@ -233,21 +227,19 @@ patients, and the number of patients is the binding constraint here.
 
 ### Combining the models and calibration
 
-The transformer does not beat GBDT clearly on its own, but it disagrees with it. Averaged
-over conditions, the rank correlation of their out-of-fold scores is 0.574, against 0.639
-for LR with GBDT and 0.753 for LR with the transformer. Averaging the three logits beats every single model on both metrics (table
+The transformer does not beat GBDT clearly on its own, but the two make different
+mistakes. Averaged over conditions, the rank correlation of their out-of-fold scores is
+0.574, against 0.639 for LR with GBDT and 0.753 for LR with the transformer. Averaging the three logits beats every single model on both metrics (table
 at the top).
 
-Averaging logits distorts probabilities. Uncalibrated, the average predicts 0.64× the
-observed event rate among at-risk patients. Each condition therefore gets a Platt map (two parameters), fitted on
-the out-of-fold predictions of all 2,791 training patients. The same rule is used for all
-40 conditions. For five acute conditions the fitted slope is negative, which reverses
-the model's ranking for them; this accounts for the small AUROC and AP gain below, and is
-discussed in §4. Cross-fitted, calibration improves
-Brier from 0.04147 to 0.04021, AUROC from 0.7747 to 0.7755 and AP from 0.2421 to 0.2435.
-It also beat fitting the maps on validation: in 200 random half-splits of validation,
-maps fitted out-of-fold had lower Brier on the held-out half every time (0.03941 against
-0.04040).
+Averaging logits distorts probabilities: uncalibrated, the average predicts only 0.64×
+as many diagnoses as actually happen. So each condition gets its own small correction,
+`p = sigmoid(a · logit + b)` (Platt scaling, two numbers per condition). The 80 numbers are
+fitted on the out-of-fold predictions of the 2,791 training patients, which are predictions
+the models made for patients they had not seen. Measured by Brier score (the mean squared
+error between the predicted probability and the 0/1 outcome; lower is better), the
+correction takes the predictions from 0.04147 to 0.04021, when each fold's correction is
+fitted on the other four folds. It also beat fitting the correction on the validation set.
 
 `python -m src.reproduce --from-hub sallamsaka/M31-Coding-Test` rebuilds `predictions.csv`
 from the published files. It matches the submitted file to 7.4e-08.
@@ -256,33 +248,61 @@ from the published files. It matches the submitted file to 7.4e-08.
 
 ## 3. AI workflow
 
-*Draft of the facts, to be rewritten.*
+I used [tool] as the main pair-programmer for the whole project: about 290 of my messages
+over 7 days. It wrote nearly all the code, ran the experiments (often overnight on CPU),
+and searched the literature. I decided what to build, what to test and what to ship. The
+parts of the workflow that mattered:
 
-I used [tool] throughout: to write code and tests, to run and monitor experiments, and to
-explain parts of the model back to me. What made it useful was checking what it produced,
-not trusting it:
+**A written memory the assistant had to read.** Its context ran out and was compressed
+about 30 times, and every time it lost what had been settled. So it kept one notes file
+with every measured number, every bug (what looked fine, what was wrong, how it was
+caught) and every open decision, and read it before starting anything. A short rules file
+held the non-negotiables: the given splits are never changed, only one module may parse a
+timestamp, every result needs an interval, and the label counts (5,214 positives) are a
+tripwire. Two hooks enforced things it kept getting wrong. One blocked piping a background
+job through `grep`/`tail`, which left the log empty for a whole run four times. The other
+blocked it from ending a turn while the fast tests failed.
 
-- **A surprising result got a bug hunt before it got a write-up.** Early on, a
-  data-augmentation experiment showed "more data hurts". It turned out to be two bugs. A
-  cache key left out a config field, so the control arm silently loaded the augmented
-  data. And regularisation was not rescaled when the number of rows grew 13.5×.
-- **Tests on behaviour, not on flags.** A code patch once failed to apply without any
-  error. The model still ran and the old tests still passed. A test that checks
-  behaviour caught it: changing a later event must move an earlier position's output under
-  a bidirectional mask, and must not under a causal one. Another test checks that batched
-  prediction returns rows in the original order. Without it, every patient would have been
-  scored against someone else's labels, and the metrics would only have looked slightly
-  worse.
-- **Claims had to reproduce a number.** When I asked for explanations of the model, I made
-  it trace a real patient through the saved weights. Its hand-computed output matched the
-  model's to 4.8e-07. Several of its confident claims failed this check: the parameter
-  count, whether the time-gap bias did anything, and what the causal mask does at one
-  layer. The same pass turned up the missing age information that became the adopted
-  change in §2.
-- **Decisions stayed mine.** Every experiment was chosen from a ranked list with its
-  expected effect and cost. I decided what ran and what shipped, and some suggestions were
-  rejected. For example, it proposed screening transformer ideas with logistic regression,
-  which cannot see sequence effects at all.
+**Options ranked before any decision.** I pasted the same standing instruction at the start
+of most decisions: list every option, estimate each one's effect and cost with numbers,
+argue against the favourite, and rank them. When it simply agreed with me, I called that
+out ("stop being a yes man, now idk if im right or wrong"). This is how the final sweep
+(§2) was chosen: a ranked list of weaknesses of the shipped model, each with an expected
+effect, then one change per run.
+
+**Asking for explanations it could not bluff.** I made it explain the shipped model from
+the inputs up, and rejected summaries and analogies until it traced a real patient through
+the saved weights. That exposed its own wrong claims (it had told me 334k parameters; the
+model had 561k), and it produced the two changes I made: removing the time-gap attention
+bias, which did nothing, and adding age at each event, which was the largest gain (§2).
+
+**Where I caught it being wrong.** The assistant was fast and usually right on code, and
+repeatedly wrong on judgement:
+
+- *Evaluation.* It carved patients out of the training set as a private test set, then
+  kept a fixed test fold, while the provided validation set sat unused. I pushed for
+  cross-validation over all 2,791 training patients, rotating the held-out fold. That is
+  what the results table uses.
+- *"More data hurts."* An augmentation experiment said adding training examples made the
+  model worse. I refused to believe it, and it turned out to be two bugs. After fixing
+  them, augmentation was still a null.
+- *Pretraining.* When pretraining did not help, I asked whether we were using it fully. A
+  linear probe showed the pretrained weights did learn something (§2). I also pointed out
+  that training patients' events after the anchor are legal pretraining data, which it had
+  left out.
+- *Representation.* I questioned why common and rare labs were encoded differently, and
+  why text answers like smoking status were dropped. Both became tested changes (§2).
+- *Calibration.* It calibrated 35 conditions and skipped 5. I asked for one rule for all
+  40, which is what ships.
+- *Averaging weights over training (EMA).* I objected that averaging weights needs the
+  weights to be close to linearly related. The measurement agreed: it did not help.
+
+**What it was bad at, concretely.** It stated numbers from memory that were wrong: a seed
+standard deviation off by 10×, and a model ranking made from a point estimate with no
+interval. It started a second "cheap" job that ran the machine out of memory and killed a
+40-minute training run. It trusted stale plan files and repeated finished work. It also
+kept arguing for its own evaluation design after I had asked for a different one. Every
+one of these became a written rule or a test, so the same mistake did not happen twice.
 
 ---
 
@@ -302,10 +322,19 @@ AUROC 0.78–0.80. Chronic CHF is newly diagnosed in 19.2% of patients who die a
 those who don't. The reason is how the anchor is defined. It is five years before the last
 encounter, and 43% of training patients have a death date, all within 30 days of the
 window's end. For those patients the outcome window is their last five years of life, and
-the diseases that kill them are diagnosed inside it. The model cannot see death, but it
-can see its precursors: age, a long list of chronic conditions, heavy recent care. This is
-not leakage, because the test anchors were made by the same rule. It does mean part of
-what the model learns is "is this record about to end".
+the diseases that kill them are diagnosed inside it.
+
+The model never sees the death date, but it does not need to: **the anchor's calendar
+date gives death away.** Patients still alive at the end of the data have a last encounter
+near the data export, so their anchor falls in 2016. Patients who died have an anchor five
+years before their death, anywhere from 1917 to 2016. Of training patients anchored in
+2016, 1,119 of 1,131 are alive. Of those anchored earlier, 1,187 of 1,660 died. The anchor
+date alone predicts death at AUROC 0.99. The features carry the calendar era indirectly,
+and logistic regression on them predicts death at 0.991 out of fold. This is not leakage:
+the test anchors are given to us, were made by the same rule, and follow the same date
+pattern (57% anchored before 2016, against 60% in train). But it means a large part of
+the high scores comes from "this patient is about to die", which the task's anchor rule
+makes visible, rather than from clinical foresight.
 
 **Conditions gated by age or sex: 0.93–0.98.** Normal pregnancy (age alone: 0.087, so
 younger means more likely, and only women), obesity, the prostate conditions (men only).

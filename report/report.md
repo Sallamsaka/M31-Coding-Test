@@ -206,6 +206,32 @@ metrics. Synthea's disease modules trigger on age, and with one layer the only a
 before this was a single feature at the readout. Time before the anchor cannot tell
 "first seen at 25" from "first seen at 55".
 
+### Everything else that was tried
+
+The table above is the last sweep. Earlier experiments, most of them run before
+cross-validation existed and scored on validation (365 patients) or on a held-out slice of
+the training patients. Differences under about 0.01 on those sets cannot be told apart.
+
+| experiment | what changed | result | kept? |
+|---|---|---|---|
+| **feature fusion** (20-run designed experiment) | transformer also reads the 3,320 tabular features | **+0.053 AP**, the largest effect in the project | yes |
+| learning rate (5 values) | 6e-4 → 1.2e-3 | +0.011 AP | yes |
+| learning rate + fusion width together | 1.2e-3 with a 128-wide feature projection | +0.022 AP [+0.006, +0.037], 3 of 3 seeds | yes |
+| seed averaging | mean of 3 seeds' logits | +0.013 AP | yes |
+| dropout (designed experiment) | 0 vs 0.35 | −0.012 AP [−0.030, +0.006] (not resolvable, leans harmful) | no dropout |
+| modality dropout | randomly hide the feature branch | 0.2418 vs 0.2474 AP | no |
+| bigger model | 2 layers, width 128, 4 heads | −0.009 AP, 3 of 3 seeds | no |
+| training to 30 epochs | no early stopping | −0.022 AP vs the stopped epoch | early stopping |
+| weight averaging (EMA) | average weights over training | +0.003 AUROC, AP won 23 of 48 runs | no |
+| time ablation (7 arms) | remove time signals one by one | order and time together are worth +0.030 AUROC; either signal alone was redundant | Time2Vec kept, gap bias later removed |
+| causal vs bidirectional mask | attention direction | +0.015 AUROC [−0.003, +0.032] | causal |
+| data augmentation (5 tests, 2 models) | extra examples from earlier cutoffs | null or harmful every time | no |
+| LR feature blocks (6, factorial) | reasons, lab slopes, time since, cost, age residuals, dedup | largest effect 0.0006 | kept, inert |
+| GBDT settings (screen + retest) | leaf size and others | effect reversed on retest | defaults |
+| ensemble membership | which models to average | 3-model average best, +0.011 AP over best single | yes |
+| logit vs probability averaging | how to average | 0.2755 vs 0.2635 AP | logit |
+| grouping related conditions | share strength across a disease family | harmful, down to −0.024 AP | no |
+
 ### Pretraining, as the brief recommends
 
 I pretrained the same model on next-event prediction, then fine-tuned it, and compared it
@@ -248,61 +274,84 @@ from the published files. It matches the submitted file to 7.4e-08.
 
 ## 3. AI workflow
 
-I used [tool] as the main pair-programmer for the whole project: about 290 of my messages
-over 7 days. It wrote nearly all the code, ran the experiments (often overnight on CPU),
-and searched the literature. I decided what to build, what to test and what to ship. The
-parts of the workflow that mattered:
+I used [tool] as an agent with access to my terminal. It wrote nearly all of the code,
+ran every experiment and read the literature. My job was deciding what to research, what
+to build, what counted as evidence, and what shipped. The project took 7 days and about
+290 of my messages.
 
-**A written memory the assistant had to read.** Its context ran out and was compressed
-about 30 times, and every time it lost what had been settled. So it kept one notes file
-with every measured number, every bug (what looked fine, what was wrong, how it was
-caught) and every open decision, and read it before starting anything. A short rules file
-held the non-negotiables: the given splits are never changed, only one module may parse a
-timestamp, every result needs an interval, and the label counts (5,214 positives) are a
-tripwire. Two hooks enforced things it kept getting wrong. One blocked piping a background
-job through `grep`/`tail`, which left the log empty for a whole run four times. The other
-blocked it from ending a turn while the fast tests failed.
+**Research at scale.** Before any modelling decision I had it do a literature search, and
+I ran seven rounds of these. In each round it launched 3 to 20 research agents in parallel,
+one per topic. Some of those agents launched their own sub-agents. Together they made about
+2,500 web fetches and 900 searches, covering roughly 370 arXiv papers. 275 PDFs were read
+page by page rather than summarised from abstracts. I asked for exact extractions, for
+example "extract verbatim how BEHRT represents time", not overviews. Each round fed a
+specific decision:
 
-**Options ranked before any decision.** I pasted the same standing instruction at the start
-of most decisions: list every option, estimate each one's effect and cost with numbers,
-argue against the favourite, and rank them. When it simply agreed with me, I called that
-out ("stop being a yes man, now idk if im right or wrong"). This is how the final sweep
-(§2) was chosen: a ranked list of weaknesses of the shipped model, each with an expected
-effect, then one change per run.
+- EHR time encoding papers produced a written comparison of options. CEHR-BERT's result
+  (adding time to token embeddings was worse than no time at all in 7 of 8 settings) is
+  why time is concatenated, not summed.
+- EHRSHOT and small-data benchmarks, where count features with gradient boosting match a
+  large pretrained model at our cohort size, are why LR and GBDT were built as serious
+  competitors rather than token baselines.
+- Delphi-2M's use of age alongside time is the precedent for age at each event.
+- The statistics literature (sample-size criteria, test-set reuse, multiple comparisons)
+  is why every result here has an interval and why models are selected by
+  cross-validation.
 
-**Asking for explanations it could not bluff.** I made it explain the shipped model from
-the inputs up, and rejected summaries and analogies until it traced a real patient through
-the saved weights. That exposed its own wrong claims (it had told me 334k parameters; the
-model had 561k), and it produced the two changes I made: removing the time-gap attention
-bias, which did nothing, and adding age at each event, which was the largest gain (§2).
+Rounds were usually started because I thought a plan rested on intuition: "some of ur
+decisions are just random or intuitive, not rly rigorous".
 
-**Where I caught it being wrong.** The assistant was fast and usually right on code, and
-repeatedly wrong on judgement:
+**Planning before code.** Every non-trivial step started as a written plan I had to
+approve. It proposed 42 plans. I sent 28 back with changes, and one was revised ten times
+before I accepted it. Each plan had to list the options with estimated effect and cost,
+rank them, and argue against its own favourite. I also had separate review agents attack a
+plan before I saw it. Before long unattended runs, the expected outcome and the adoption
+rule were written into the repository first, so a result could not be reinterpreted after
+the fact. The final sweep in §2 was run this way.
 
-- *Evaluation.* It carved patients out of the training set as a private test set, then
-  kept a fixed test fold, while the provided validation set sat unused. I pushed for
-  cross-validation over all 2,791 training patients, rotating the held-out fold. That is
-  what the results table uses.
-- *"More data hurts."* An augmentation experiment said adding training examples made the
-  model worse. I refused to believe it, and it turned out to be two bugs. After fixing
-  them, augmentation was still a null.
-- *Pretraining.* When pretraining did not help, I asked whether we were using it fully. A
-  linear probe showed the pretrained weights did learn something (§2). I also pointed out
-  that training patients' events after the anchor are legal pretraining data, which it had
-  left out.
-- *Representation.* I questioned why common and rare labs were encoded differently, and
-  why text answers like smoking status were dropped. Both became tested changes (§2).
-- *Calibration.* It calibrated 35 conditions and skipped 5. I asked for one rule for all
-  40, which is what ships.
-- *Averaging weights over training (EMA).* I objected that averaging weights needs the
-  weights to be close to linearly related. The measurement agreed: it did not help.
+**Unattended runs.** Training is CPU-only and a transformer configuration takes 15 to 60
+minutes, so the heavy work ran overnight: eight unattended windows in total. It wrote job
+chains that waited for one stage to finish before starting the next, retried failures
+three times, and resumed from saved checkpoints. The designed experiment, the
+cross-validation, pretraining and the final sweep all ran while I slept, and I reviewed
+the results in the morning.
 
-**What it was bad at, concretely.** It stated numbers from memory that were wrong: a seed
-standard deviation off by 10×, and a model ranking made from a point estimate with no
-interval. It started a second "cheap" job that ran the machine out of memory and killed a
-40-minute training run. It trusted stale plan files and repeated finished work. It also
-kept arguing for its own evaluation design after I had asked for a different one. Every
-one of these became a written rule or a test, so the same mistake did not happen twice.
+**Keeping it on track across sessions.** The assistant's working memory ran out and was
+compressed about 30 times. I set up four things so that nothing settled was lost or
+redone, starting from a best-practices guide I gave it:
+
+- *A knowledge file.* One document with every measured number and every decision. It is
+  now about 5,600 lines. Each new session read it first.
+- *A rules file.* A short list it reads at the start of every session, for example "never
+  change the provided splits" and "no result without an interval".
+- *Two automatic checks on its actions.* One stopped it from running a background job in
+  a way that hid the job's output (this had wasted whole runs). The other stopped it from
+  finishing a task while tests were failing.
+- *Two checklists.* One for running an experiment, one for publishing. Each step is there
+  because it had failed at least once.
+
+It also wrote the audit and diagnostic scripts, the 152 tests, the figures (every number
+traced to the script that produced it), the Hugging Face upload, the reproduction script
+and the wandb logging.
+
+**Learning the model through it.** I had not trained a transformer from scratch before.
+So I made it teach me the shipped model from the inputs up, and I rejected summaries and
+analogies until it traced one real patient through the saved weights. Its hand
+calculation matched the model to 4.8e-07. That walkthrough is where the adopted change
+came from. It showed that the model had no sense of the patient's age at each event, and
+that the time-gap attention bias did nothing.
+
+**Where my input mattered.** Some ideas were mine: fusing every lab consistently, keeping
+text answers, pretraining on events after the anchor, a schedule-free optimiser from
+another project of mine, and one calibration rule for all 40 conditions. I also rejected
+its evaluation design, which held a fixed slice of training patients out as a private test
+set while the given validation set went unused. What replaced it is the rotating 5-fold
+cross-validation used for every number in this report. It drafted the two clarifying
+questions I sent to the assignment owner, one of which confirmed the label window.
+
+**Its main weakness** was stating numbers from memory as if measured: a parameter count
+off by 40%, a seed variance off by 10×. The rule that fixed this was that every claim must
+reproduce from a file or a run.
 
 ---
 
@@ -332,9 +381,18 @@ years before their death, anywhere from 1917 to 2016. Of training patients ancho
 date alone predicts death at AUROC 0.99. The features carry the calendar era indirectly,
 and logistic regression on them predicts death at 0.991 out of fold. This is not leakage:
 the test anchors are given to us, were made by the same rule, and follow the same date
-pattern (57% anchored before 2016, against 60% in train). But it means a large part of
-the high scores comes from "this patient is about to die", which the task's anchor rule
-makes visible, rather than from clinical foresight.
+pattern (57% anchored before 2016, against 60% in train).
+
+So is the model only learning "this record is about to end"? No. It also learns *which
+disease* will end it. In Synthea these diagnoses almost only happen in dying patients:
+pneumonia 133 of 133 positives, CHF 224 of 229, myocardial infarction 151 of 153, lung
+cancer 74 of 76. Scoring the model **only among patients who die** removes the "about to
+end" signal entirely, and it still ranks them well: pneumonia 0.927, prostate neoplasm
+0.970, myocardial infarction 0.862, lung cancer 0.850, CHF 0.767, stroke 0.697. So the
+score has two parts. The anchor date says *whether* the patient is in their last five
+years (death alone gives 0.78–0.80). The history (age, sex, chronic conditions, labs)
+says *what* they will die of. In a real hospital the first part would not exist, because
+real follow-up does not end at death by construction.
 
 **Conditions gated by age or sex: 0.93–0.98.** Normal pregnancy (age alone: 0.087, so
 younger means more likely, and only women), obesity, the prostate conditions (men only).

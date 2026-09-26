@@ -219,7 +219,9 @@ def fig_per_condition_cv() -> None:
         print("  per_condition_cv.csv absent -- skipped")
         return
     t = pd.read_csv(p).sort_values("auroc")
-    acute = t.name.str.lower().str.contains("|".join(ACUTE))
+    nm = t.name.str.lower()
+    # "Pathological fracture due to osteoporosis" is bone fragility, not an injury.
+    acute = nm.str.contains("|".join(ACUTE)) & ~nm.str.contains("pathological")
     fig, ax = plt.subplots(figsize=(7.2, 7.4))
     ax.barh(t.name.str.replace(r" \((disorder|finding|situation)\)", "", regex=True),
             t.auroc - 0.5, left=0.5, height=0.7,
@@ -227,7 +229,7 @@ def fig_per_condition_cv() -> None:
     ax.axvline(0.5, color=INK, lw=0.8)
     ax.set_xlim(0.4, 1.0)
     ax.set_xlabel("test-fold AUROC (5-fold CV, 2,791 training patients)")
-    ax.set_title("Chronic, age/sex-gated conditions vs random acute events (red)")
+    ax.set_title("Per-condition AUROC; acute one-off events in red")
     ax.tick_params(axis="y", labelsize=7)
     ax.grid(axis="x", alpha=0.25, lw=0.6)
     fig.savefig(OUT / "per_condition_cv.png")

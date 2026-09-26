@@ -53,8 +53,8 @@ blockquote p { margin: .25rem 0; }
 table {
   border-collapse: collapse; width: 100%; margin: .9rem 0;
   font-size: 9.4pt; font-variant-numeric: tabular-nums;
-  page-break-inside: avoid;
 }
+tr { page-break-inside: avoid; }
 th, td { border: 1px solid var(--rule); padding: .34rem .5rem; text-align: left;
          vertical-align: top; }
 th { background: #eef2f7; font-weight: 600; }

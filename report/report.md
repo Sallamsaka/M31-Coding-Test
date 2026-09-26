@@ -290,8 +290,8 @@ specific decision:
   competitors rather than token baselines.
 - Delphi-2M's use of age alongside time is the precedent for age at each event.
 - The statistics literature (sample-size criteria, test-set reuse, multiple comparisons)
-  is why every result here has an interval and why models are selected by
-  cross-validation.
+  is why the experiments are reported with intervals and why models are selected
+  by cross-validation.
 
 Rounds were usually started because I thought a plan rested on intuition: "some of ur
 decisions are just random or intuitive, not rly rigorous".
@@ -355,7 +355,7 @@ the same tabular features to predict death gets AUROC 0.991.
 
 The model does more than detect "about to die". Scored only among patients who die, where
 that signal is gone, it still picks out the right disease: prostate cancer 0.970, pneumonia
-0.927, heart attack 0.862, lung cancer 0.850, heart failure 0.767. So the anchor date tells
+0.927, heart attack 0.862, lung cancer 0.850, heart failure 0.767. So when the record ends tells
 the model *whether* a patient is in their last five years, and the history (age, sex,
 chronic conditions, labs) tells it *what* they will die of. A real deployment would not
 have the first part: there the prediction date is simply today, and nobody knows whether

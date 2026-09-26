@@ -463,7 +463,7 @@ def test_fused_feature_token_is_visible_to_the_whole_sequence():
 # --------------------------------------------------------------------------
 # Ablation switches for the design-claim experiment (W7).
 #
-# `docs/01-why-time.md` argues formally that without a positional signal a
+# The standard argument is that without a positional signal a
 # transformer sees only a multiset. That argument is the intellectual centre of
 # the submission and nothing measured it, because until now the model had no
 # switch to turn the time signals off. These tests assert the switches do what
@@ -532,7 +532,7 @@ def test_ablating_time_does_NOT_by_itself_produce_a_bag_of_codes():
     The visibility mask is derived from `dt`, so a causal model still knows
     which event came first even with both explicit time signals removed.
     Permuting positions must therefore still move the output. A "no time" arm
-    is *not* the multiset baseline that `01-why-time.md` reasons about.
+    is *not* the multiset baseline that argument reasons about.
     """
     tokens, dt, lengths = _fixed_batch()
     m = _ablated(use_time_encoding=False, use_dt_bias=False)
@@ -545,7 +545,7 @@ def test_ablating_time_does_NOT_by_itself_produce_a_bag_of_codes():
 
 
 def test_the_true_multiset_baseline_is_permutation_invariant():
-    """`01-why-time.md`'s claim, made executable.
+    """The multiset claim, made executable.
 
     Drop both time signals AND the direction constraint AND the position-picking
     readout, and what is left provably cannot distinguish orderings: every

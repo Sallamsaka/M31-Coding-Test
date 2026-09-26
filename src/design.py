@@ -451,8 +451,7 @@ def propose_config(df, metric="macro_ap", shrink_it=True):
         # DELIBERATELY the centre-only sigma, not the pooled 7-df estimate
         # that `analyse_design` now uses. Shrinkage strength depends on it, so
         # switching would move every predicted cell -- and the top cell's
-        # prediction has already been pre-registered in the ledger and in
-        # docs/PRE-REGISTRATION.md as the thing the confirmation runs test.
+        # prediction has already been pre-registered in the ledger as the thing the confirmation runs test.
         # Changing the estimator after recording the prediction and before
         # reading the result is a forking path, and a small one is still one.
         # Revisit only after the confirmation has been scored, as a stated

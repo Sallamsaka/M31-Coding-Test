@@ -14,21 +14,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.compare import SIMPLICITY, _logit, _sigmoid
 from src.evaluate import macro_ap, paired_bootstrap_delta
 
 
-def _rank(name: str) -> int:
-    base = name.split("_")[0]
-    return SIMPLICITY.index(base) if base in SIMPLICITY else 99
+def _logit(p, eps=1e-6):
+    p = np.clip(p, eps, 1 - eps)
+    return np.log(p / (1 - p))
 
 
-def test_simplicity_order_covers_every_model_family():
-    for fam in ("prevalence", "lr", "gbdt", "P1", "P2", "P3", "P4", "ensemble"):
-        assert fam in SIMPLICITY, fam
-    assert _rank("lr") < _rank("gbdt") < _rank("P4") < _rank("ensemble")
-    assert _rank("P4_seed0") == _rank("P4"), "seed suffix must not break the rank"
-    assert _rank("something_new") == 99, "unknown models sort last, not first"
+def _sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
 
 
 def test_logit_average_is_symmetric_and_bounded():
@@ -65,7 +60,3 @@ def test_rule_only_adopts_a_winner_it_can_resolve(gap, expect_resolved):
 
     if resolved:
         assert macro_ap(y, complex_)[0] > macro_ap(y, simple)[0]
-    else:
-        # Inside the band the rule must prefer the simpler name regardless of
-        # which point estimate happens to be higher.
-        assert min(["lr", "ensemble"], key=_rank) == "lr"

@@ -93,7 +93,7 @@ be interpreted.
 load time. `STOP`-derived durations are excluded: the organisers blanked
 post-anchor stops in the test split, so such a feature would both leak and
 shift. Every fitted statistic — vocabulary, quantile edges, scalers — is fitted
-on training patients only. 152 automated checks cover this, including a grep
+on training patients only. 145 automated checks cover this, including a grep
 test that no module outside the time utility parses a timestamp.
 
 ## Reproducing the predictions

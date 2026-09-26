@@ -262,8 +262,7 @@ def run_cv(root: str = ".", n_splits: int = 5, verbose: bool = True,
     # PER-FOLD RESUME. A fold is ~30 minutes and this run has now died twice on
     # GBDT with an ArrayMemoryError -- once at fold 3, once at fold 4 -- losing
     # every completed fold both times, because the OOF matrices only reach disk
-    # at the very end. `arms.py`, `design.confirm_runs` and `gbdt_programme` all
-    # resume; this, the longest job in the project, did not.
+    # at the very end. `design.confirm_runs` resumes; this, the longest job in the project, did not.
     #
     # Each fold's predictions are cached under a key that includes the model
     # list and the fold's own patient membership, so a cache cannot be reused

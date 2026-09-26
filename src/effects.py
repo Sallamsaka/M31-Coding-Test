@@ -1,11 +1,11 @@
 """Main effects from a factorial, estimated as PAIRED contrasts, with BH.
 
-Shared by `lr_programme` (2^5 blocks x dedup x C) and `design` (the transformer
-2^(5-1)). Kept separate from both because it is pure arithmetic on a table and
+Used by `design` (the transformer
+2^(5-1)). Kept separate from it because it is pure arithmetic on a table and
 is therefore the one part of the experimental machinery that can be tested
 without spending an hour of CPU.
 
-**Why paired.** An earlier version of `lr_programme.main_effects` computed
+**Why paired.** An earlier version of this computed
 
     effect = mean(scores | f=1) - mean(scores | f=0)
     SE     = sqrt(var_hi/n_hi + var_lo/n_lo)          # two-sample, unpaired

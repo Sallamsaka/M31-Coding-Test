@@ -1,6 +1,6 @@
 """Does the time signal earn its place? The design-claim experiment.
 
-`docs/01-why-time.md` argues formally that without a positional signal a
+The standard argument is that without a positional signal a
 transformer sees only a multiset of codes. That argument is the intellectual
 centre of this submission and it had never been measured, because until the
 ablation switches were added the model had no way to turn the time signals off.

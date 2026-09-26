@@ -20,7 +20,8 @@ The test outcomes are withheld, so **test-set AUROC and mAP cannot be computed h
 They are estimated instead by 5-fold cross-validation on the 2,791 training patients.
 Each fold is scored by models trained on the other four. The provided splits are not
 changed: validation patients are never trained on, and the transformer uses the
-validation set only to pick its stopping epoch. Mean ± SD over the five held-out folds:
+validation set only to pick its stopping epoch. Mean ± standard deviation across the five held-out folds (the ± shows how much the score
+varied from fold to fold; it is not a confidence interval):
 
 | model | macro AUROC | macro AP (mAP) |
 |---|---|---|
@@ -51,10 +52,6 @@ The vocabulary is 1,105 tokens and is built from training patients only. Sequenc
 capped at 512 events, keeping the most recent. The sequence ends in an `[ANCHOR]` token,
 and the prediction is read from that position.
 
-Why events rather than visits: one visit bundles about 20 simultaneous labs and vitals, and
-observations are 62% of all events. Collapsing a visit into one vector throws away which
-lab had which value.
-
 ### Lab values are fused into the token
 
 A numeric lab becomes a single token that carries its level: `OBS_8480-6_Q7` is systolic
@@ -68,12 +65,9 @@ Text-valued answers (smoking status, the urinalysis panel) are kept as the code 
 tested adding the answer, and also fusing every lab into its token. Neither made a
 measurable difference (§2).
 
-### Time between events: continuous encodings, no position index
+### Time: two encodings per event
 
-An event's index in the sequence says little about when it happened. The most recent event
-before the anchor can be anywhere from 7 to 224 days old. Measured, the index carries 0.68
-bits of the 4.99 bits of information in time-to-anchor, or 13.6%. So there are **no position
-embeddings**. Each event instead gets two continuous time encodings (Time2Vec):
+Each event carries two time encodings (Time2Vec), learned as part of the model:
 
 - **Time before the anchor**, `log(1 + days)`: one linear term plus 63 learned sine
   features. The log is needed because gaps span more than four orders of magnitude, up to
@@ -81,9 +75,8 @@ embeddings**. Each event instead gets two continuous time encodings (Time2Vec):
 - **The patient's age at that event**, in decades, encoded the same way. This was added
   late, and it is the single largest transformer improvement measured (§2).
 
-The token embedding (64 dimensions) and the two time encodings (64 each) are
-**concatenated**, then projected back to 64 dimensions. They are not summed: summing makes
-attention compare content against time through one shared projection.
+The token embedding (64 dimensions) and the two time encodings (64 each) are placed side
+by side (192 dimensions) and projected back to 64.
 
 ![Head 2's attention to a blood-pressure reading, by its age](../outputs/figures/time_attention.png)
 
@@ -97,7 +90,7 @@ Events that share a timestamp (97.7% of events share one with at least one other
 treated as simultaneous. Conditions carry a date with no time, so they are stamped at
 midnight. For ordering only, they are moved onto the first encounter of the same day, so
 that a diagnosis does not appear to come before the visit that made it. Labels never read
-this adjusted timestamp (see "Labels" below).
+this adjusted timestamp.
 
 ### Tabular features, fused at the readout
 
@@ -106,24 +99,19 @@ time windows, last lab values, demographics, and age. LR and GBDT use them direc
 transformer projects them to 128 dimensions and concatenates the result with its sequence
 summary before the output layer.
 
-### Labels, and what is refused
+### Fields used, and what is refused
 
-```
-features:  ts <  anchor                       (right edge open)
-label:     anchor <= first_dx <= anchor + 5y  (both edges closed)
-first_dx = earliest diagnosis over the whole record
-```
+| source | in the event sequence (transformer) | in the tabular features (all three models) |
+|---|---|---|
+| the ten event tables | one token per row, from its `CODE` (imaging: `MODALITY_CODE`) | how many times each code (from all ten tables) appeared in the last year, the last five years, and ever |
+| observation `VALUE` | numeric: decile, fused into the token; text: not used | last value, decile counts, trend over time |
+| `REASONCODE` (why a drug, procedure or care plan was given) | not used (tested, no gain, §2) | counts per reason |
+| per-row costs (`BASE_COST`, `TOTAL_CLAIM_COST`) | not used | cost per visit |
+| sex, race, ethnicity, marital status | four tokens at the start of the sequence | one-hot columns |
+| birth date | age at each event (time encoding) | age at the anchor |
 
-- **First diagnosis over the whole record.** Synthea re-records recurring conditions.
-  Taking the earliest date *inside* the window would turn every recurrence into a false
-  positive: 1,220 extra (patient, condition) pairs, inflating the 5,214 true positives by
-  23.4%.
-- **Right edge closed.** 119 first diagnoses fall exactly on `anchor + 5y`; an open edge
-  would drop them. The organisers confirmed the window includes its final day.
-- **Prevalent pairs.** A patient already diagnosed with a condition before the anchor
-  cannot be newly diagnosed with it. These pairs are excluded from training and are set to
-  the floor probability in the submission. No such pair has a positive label, in train or
-  validation.
+Names, addresses and identifiers in `patients.csv` are dropped.
+
 - **Refused columns.** `DEATHDATE` is filled for 1,354 training/validation patients and for
   none in test. `HEALTHCARE_EXPENSES` and `HEALTHCARE_COVERAGE` are lifetime totals, about
   512× a test patient's pre-anchor claims. Any duration built from `STOP` is also refused,
@@ -157,14 +145,16 @@ pooling over a set of (event, time, age) items.
 
 ### Objective and training
 
-- **Loss:** binary cross-entropy over the 40 conditions, with prevalent pairs masked out.
-  The row still trains the shared trunk through its other conditions.
+- **Loss:** binary cross-entropy over the 40 conditions. A condition the patient already
+  had before the anchor cannot be newly diagnosed, so it is left out of that patient's
+  loss; their other conditions still count.
 - **Optimiser:** AdamW, learning rate 1.2e-3, weight decay 0.001, 5% linear warm-up then
   cosine decay, batch 32 (grouped by sequence length), no dropout.
 - **Stopping:** up to 30 epochs; early stopping on validation macro AP with patience 4
   (gains under 0.002 do not count).
 - **Seeds:** three seeds (300, 301, 302), averaged in logit space.
-- **LR:** C = 0.03 on log1p counts. **GBDT:** 300 trees, learning rate 0.05, 15 leaves,
+- **LR:** L2-regularised, strength C = 0.03 (small C means a strong penalty); counts
+  enter as log(1 + count). **GBDT:** 300 trees, learning rate 0.05, 15 leaves,
   L2 1.0.
 
 Hyperparameters were chosen on an inner split of the training patients (2,233 fit / 558
@@ -184,9 +174,12 @@ epoch 5. The model overfits after a few epochs, which is expected with 2,791 pat
 
 I listed specific weaknesses of the model, then tested each fix as exactly **one change**
 against the same baseline, on the same five folds (all 2,791 training patients scored out
-of fold). The decision rule was written down before any result existed. A change is a
-candidate if the bootstrap probability that it helps is at least 0.75 and the other metric
-does not go down. A candidate is adopted only after it holds up on new seeds.
+of fold). The intervals come from a paired bootstrap: resample the 2,791 patients with
+replacement 300 times (500 for the age confirmation below), recompute the difference between the two models on each resample,
+and take the middle 95% of those differences. The decision rule was written down before the
+sweep ran. A change is a candidate if it improves AP in at least 75% of the resamples and
+its AUROC does not go down (or the same with the metrics swapped). A candidate is adopted
+only after it holds up on new seeds.
 
 | change vs baseline (transformer alone, 1 seed) | Δ macro AP [95% CI] | Δ macro AUROC [95% CI] | result |
 |---|---|---|---|
@@ -202,9 +195,8 @@ seeds it improves the transformer by +0.0143 AP [+0.0056, +0.0210] and +0.0114 A
 [+0.0061, +0.0166]. It improves the three-model average by +0.0056 AP [+0.0020, +0.0099]
 and +0.0043 AUROC [+0.0020, +0.0064] (measured on the first three folds, which were the
 only folds with LR and GBDT predictions at the time). It helped at every seed on both
-metrics. Synthea's disease modules trigger on age, and with one layer the only age signal
-before this was a single feature at the readout. Time before the anchor cannot tell
-"first seen at 25" from "first seen at 55".
+metrics. Before this, the transformer's only age signal was one feature at the readout,
+and time before the anchor cannot tell "first seen at 25" from "first seen at 55".
 
 ### Everything else that was tried
 
@@ -216,21 +208,20 @@ the training patients. Differences under about 0.01 on those sets cannot be told
 |---|---|---|---|
 | **feature fusion** (20-run designed experiment) | transformer also reads the 3,320 tabular features | **+0.053 AP**, the largest effect in the project | yes |
 | learning rate (5 values) | 6e-4 → 1.2e-3 | +0.011 AP | yes |
-| learning rate + fusion width together | 1.2e-3 with a 128-wide feature projection | +0.022 AP [+0.006, +0.037], 3 of 3 seeds | yes |
+| learning rate + fusion width together | 1.2e-3 with a 128-wide feature projection | +0.022 AP, better at all 3 seeds | yes |
 | seed averaging | mean of 3 seeds' logits | +0.013 AP | yes |
-| dropout (designed experiment) | 0 vs 0.35 | −0.012 AP [−0.030, +0.006] (not resolvable, leans harmful) | no dropout |
+| dropout (designed experiment) | 0 vs 0.35 | −0.012 AP, too small to tell from zero | no dropout |
 | modality dropout | randomly hide the feature branch | 0.2418 vs 0.2474 AP | no |
 | bigger model | 2 layers, width 128, 4 heads | −0.009 AP, 3 of 3 seeds | no |
 | training to 30 epochs | no early stopping | −0.022 AP vs the stopped epoch | early stopping |
 | weight averaging (EMA) | average weights over training | +0.003 AUROC, AP won 23 of 48 runs | no |
-| time ablation (7 arms) | remove time signals one by one | order and time together are worth +0.030 AUROC; either signal alone was redundant | Time2Vec kept, gap bias later removed |
-| causal vs bidirectional mask | attention direction | +0.015 AUROC [−0.003, +0.032] | causal |
+| removing time information (7 versions, 2-layer model) | each version removed a different time input: event order, the time encoding, a time-gap attention bias | order plus time vs neither: +0.030 AUROC; removing the time encoding and the gap bias together: no change | time encoding kept, gap bias removed |
+| causal vs bidirectional mask | attention direction | +0.015 AUROC on validation, too small to tell from zero | causal |
 | data augmentation (5 tests, 2 models) | extra examples from earlier cutoffs | null or harmful every time | no |
-| LR feature blocks (6, factorial) | reasons, lab slopes, time since, cost, age residuals, dedup | largest effect 0.0006 | kept, inert |
+| extra LR feature groups (6 groups, every combination) | drug reasons, lab trends, time since last event, cost, age adjustments, duplicate removal | largest effect 0.0006 AUROC | kept, no effect |
 | GBDT settings (screen + retest) | leaf size and others | effect reversed on retest | defaults |
 | ensemble membership | which models to average | 3-model average best, +0.011 AP over best single | yes |
 | logit vs probability averaging | how to average | 0.2755 vs 0.2635 AP | logit |
-| grouping related conditions | share strength across a disease family | harmful, down to −0.024 AP | no |
 
 ### Pretraining, as the brief recommends
 
@@ -239,7 +230,8 @@ against the same model fine-tuned from scratch.
 
 - **Pre-anchor events of training patients** (measured before age was added). The warm-up trains: next-event loss falls
   from 6.20 to 2.95, against 7.01 for a uniform guess. End to end it changes nothing:
-  macro AP −0.0015 [−0.0339, +0.0309], AUROC +0.0009 [−0.0086, +0.0103]. It did learn
+  over three seeds, macro AP moved −0.0099, −0.0081 and +0.0136, and AUROC +0.0014,
+  −0.0032 and +0.0044, with no consistent direction. It did learn
   something. A linear probe on the frozen trunk gets 0.1120 AP from the pretrained weights
   against 0.0996 from random ones. But supervised fine-tuning builds the same thing within
   a few epochs, from either start.
@@ -253,10 +245,13 @@ patients, and the number of patients is the binding constraint here.
 
 ### Combining the models and calibration
 
-The transformer does not beat GBDT clearly on its own, but the two make different
-mistakes. Averaged over conditions, the rank correlation of their out-of-fold scores is
-0.574, against 0.639 for LR with GBDT and 0.753 for LR with the transformer. Averaging the three logits beats every single model on both metrics (table
-at the top).
+The transformer does not clearly beat GBDT on its own, but the two disagree about which
+patients are at risk, and disagreement is what makes averaging pay off. To measure it, for
+each condition I ranked the patients by each model's out-of-fold score and computed the
+Spearman correlation between the two rankings (1 = identical order), then averaged over the
+40 conditions. GBDT and the transformer: 0.574. LR and GBDT: 0.639. LR and the transformer:
+0.753. Averaging the three logits beats every single model on both metrics (table at the
+top).
 
 Averaging logits distorts probabilities: uncalibrated, the average predicts only 0.64×
 as many diagnoses as actually happen. So each condition gets its own small correction,
@@ -274,7 +269,7 @@ from the published files. It matches the submitted file to 7.4e-08.
 
 ## 3. AI workflow
 
-I used [tool] as an agent with access to my terminal. It wrote nearly all of the code,
+I used Claude Code as an agent with access to my terminal. It wrote nearly all of the code,
 ran every experiment and read the literature. My job was deciding what to research, what
 to build, what counted as evidence, and what shipped. The project took 7 days and about
 290 of my messages.
@@ -282,9 +277,7 @@ to build, what counted as evidence, and what shipped. The project took 7 days an
 **Research at scale.** Before any modelling decision I had it do a literature search, and
 I ran seven rounds of these. In each round it launched 3 to 20 research agents in parallel,
 one per topic. Some of those agents launched their own sub-agents. Together they made about
-2,500 web fetches and 900 searches, covering roughly 370 arXiv papers. 275 PDFs were read
-page by page rather than summarised from abstracts. I asked for exact extractions, for
-example "extract verbatim how BEHRT represents time", not overviews. Each round fed a
+2,500 web fetches and 900 searches, covering roughly 370 arXiv papers. Each round fed a
 specific decision:
 
 - EHR time encoding papers produced a written comparison of options. CEHR-BERT's result
@@ -307,7 +300,9 @@ before I accepted it. Each plan had to list the options with estimated effect an
 rank them, and argue against its own favourite. I also had separate review agents attack a
 plan before I saw it. Before long unattended runs, the expected outcome and the adoption
 rule were written into the repository first, so a result could not be reinterpreted after
-the fact. The final sweep in §2 was run this way.
+the fact. The final sweep in §2 was run this way. I also rejected its first evaluation
+design, which held a fixed slice of training patients out as a private test set; the 5-fold
+cross-validation behind every number in this report replaced it.
 
 **Unattended runs.** Training is CPU-only and a transformer configuration takes 15 to 60
 minutes, so the heavy work ran overnight: eight unattended windows in total. It wrote job
@@ -316,42 +311,15 @@ three times, and resumed from saved checkpoints. The designed experiment, the
 cross-validation, pretraining and the final sweep all ran while I slept, and I reviewed
 the results in the morning.
 
-**Keeping it on track across sessions.** The assistant's working memory ran out and was
-compressed about 30 times. I set up four things so that nothing settled was lost or
-redone, starting from a best-practices guide I gave it:
-
-- *A knowledge file.* One document with every measured number and every decision. It is
-  now about 5,600 lines. Each new session read it first.
-- *A rules file.* A short list it reads at the start of every session, for example "never
-  change the provided splits" and "no result without an interval".
-- *Two automatic checks on its actions.* One stopped it from running a background job in
-  a way that hid the job's output (this had wasted whole runs). The other stopped it from
-  finishing a task while tests were failing.
-- *Two checklists.* One for running an experiment, one for publishing. Each step is there
-  because it had failed at least once.
-
 It also wrote the audit and diagnostic scripts, the 152 tests, the figures (every number
 traced to the script that produced it), the Hugging Face upload, the reproduction script
 and the wandb logging.
 
-**Learning the model through it.** I had not trained a transformer from scratch before.
-So I made it teach me the shipped model from the inputs up, and I rejected summaries and
-analogies until it traced one real patient through the saved weights. Its hand
-calculation matched the model to 4.8e-07. That walkthrough is where the adopted change
-came from. It showed that the model had no sense of the patient's age at each event, and
-that the time-gap attention bias did nothing.
-
-**Where my input mattered.** Some ideas were mine: fusing every lab consistently, keeping
-text answers, pretraining on events after the anchor, a schedule-free optimiser from
-another project of mine, and one calibration rule for all 40 conditions. I also rejected
-its evaluation design, which held a fixed slice of training patients out as a private test
-set while the given validation set went unused. What replaced it is the rotating 5-fold
-cross-validation used for every number in this report. It drafted the two clarifying
-questions I sent to the assignment owner, one of which confirmed the label window.
-
-**Its main weakness** was stating numbers from memory as if measured: a parameter count
-off by 40%, a seed variance off by 10×. The rule that fixed this was that every claim must
-reproduce from a file or a run.
+**Asking until I understood.** I had not trained a transformer from scratch before.
+Whenever it used a term, reported a result or offered options I did not understand, I asked
+it to explain before deciding anything. Walking through the shipped model this way is where
+the adopted change came from: it showed that the model had no sense of the patient's age
+at each event.
 
 ---
 
@@ -359,67 +327,61 @@ reproduce from a file or a run.
 
 ![Per-condition test-fold AUROC](../outputs/figures/per_condition_cv.png)
 
-Per-condition AUROC ranges from 0.44 to 0.99. The spread follows one question: **does
-Synthea generate this condition from something recorded before the anchor?** To check
-this, I scored each condition with two single variables as well as the model, all on the
-out-of-fold predictions: age at the anchor, and whether the patient dies (known for
-training patients, and used here only as a diagnostic).
+Per-condition AUROC ranges from 0.44 to 0.99. A condition is easy when something recorded
+before the anchor predicts it. To find out what that something is, I compared the model
+with two single facts per condition, on the same out-of-fold predictions: the patient's age
+at the anchor, and whether the patient died at the end of their record. The death date is
+known for training patients; it was used only for this check, never as an input.
 
-**Conditions tied to death: 0.90–0.99.** CHF, myocardial infarction, pneumonia, the
-lung-cancer trio and the prostate trio. For these, whether the patient dies alone gives
-AUROC 0.78–0.80. Chronic CHF is newly diagnosed in 19.2% of patients who die and 0.3% of
-those who don't. The reason is how the anchor is defined. It is five years before the last
-encounter, and 43% of training patients have a death date, all within 30 days of the
-window's end. For those patients the outcome window is their last five years of life, and
-the diseases that kill them are diagnosed inside it.
+**Diseases people die of: 0.90–0.99.** Heart failure, heart attack, pneumonia, lung cancer,
+prostate cancer. In this data they are diagnosed almost only in patients who die: pneumonia
+in 133 of its 133 cases, heart failure 224 of 229, heart attack 151 of 153, lung cancer 74
+of 76. The reason is how the anchor is defined: five years before the last encounter. For
+the 43% of training patients who die, the last encounter in the record is always a "Death
+Certification" encounter, dated 1 to 15 days after death. So their anchor is about five
+years before their death, the five-year window is their last five years of life, and the
+disease that kills them is diagnosed inside it.
 
-The model never sees the death date, but it does not need to: **the anchor's calendar
-date gives death away.** Patients still alive at the end of the data have a last encounter
-near the data export, so their anchor falls in 2016. Patients who died have an anchor five
-years before their death, anywhere from 1917 to 2016. Of training patients anchored in
-2016, 1,119 of 1,131 are alive. Of those anchored earlier, 1,187 of 1,660 died. The anchor
-date alone predicts death at AUROC 0.99. The features carry the calendar era indirectly,
-and logistic regression on them predicts death at 0.991 out of fold. This is not leakage:
-the test anchors are given to us, were made by the same rule, and follow the same date
-pattern (57% anchored before 2016, against 60% in train).
+The model never sees the death date, but **when the record ends gives it away**. The data ends
+in July 2021. A patient who is alive keeps having encounters until then, so their anchor is
+around 2016. A patient who died has no encounters after death, so their anchor is five
+years before whenever that was. Of training patients anchored in 2016, 1,119 of 1,131 are
+alive; of those anchored before 2010, 1,027 of 1,033 died. Ranking patients by how early
+their anchor is predicts death at AUROC 0.99. The model is not given any dates either,
+but its inputs still reveal roughly when the record ends: a logistic regression trained on
+the same tabular features to predict death gets AUROC 0.991.
 
-So is the model only learning "this record is about to end"? No. It also learns *which
-disease* will end it. In Synthea these diagnoses almost only happen in dying patients:
-pneumonia 133 of 133 positives, CHF 224 of 229, myocardial infarction 151 of 153, lung
-cancer 74 of 76. Scoring the model **only among patients who die** removes the "about to
-end" signal entirely, and it still ranks them well: pneumonia 0.927, prostate neoplasm
-0.970, myocardial infarction 0.862, lung cancer 0.850, CHF 0.767, stroke 0.697. So the
-score has two parts. The anchor date says *whether* the patient is in their last five
-years (death alone gives 0.78–0.80). The history (age, sex, chronic conditions, labs)
-says *what* they will die of. In a real hospital the first part would not exist, because
-real follow-up does not end at death by construction.
+The model does more than detect "about to die". Scored only among patients who die, where
+that signal is gone, it still picks out the right disease: prostate cancer 0.970, pneumonia
+0.927, heart attack 0.862, lung cancer 0.850, heart failure 0.767. So the anchor date tells
+the model *whether* a patient is in their last five years, and the history (age, sex,
+chronic conditions, labs) tells it *what* they will die of. A real deployment would not
+have the first part: there the prediction date is simply today, and nobody knows whether
+the patient's record will end in five years.
 
-**Conditions gated by age or sex: 0.93–0.98.** Normal pregnancy (age alone: 0.087, so
-younger means more likely, and only women), obesity, the prostate conditions (men only).
-These are close to deterministic given demographics and a few codes, and they lift the
-macro average.
+**Conditions set by age or sex: 0.93–0.98.** Normal pregnancy (young women only), obesity,
+the prostate conditions (men only). Demographics nearly decide these.
 
-**Conditions that grow with age: 0.72–0.86.** Osteoporosis, Alzheimer's, stroke, atrial
-fibrillation. Age alone gets 0.75–0.78, and the model adds a little on top.
+**Conditions that become more common with age: 0.72–0.86.** Osteoporosis, Alzheimer's,
+stroke, atrial fibrillation. Age alone scores 0.75–0.78, and the model adds a little.
 
-**Acute, random events: 0.44–0.71, sixteen conditions.** Sinusitis, pharyngitis,
-bronchitis, sprains, lacerations, whiplash, concussion. Here age scores 0.41–0.66, death
-scores 0.43–0.57, and the positive rate is the same in patients who die and those who
-don't (viral sinusitis 44.1% vs 45.5%). As far as the recorded history shows, these are
-random draws, so no model can rank them. Five score below 0.5 (0.44–0.49). Concussion's
-0.44 on 69 positives is about 1.7 standard errors below chance, so this is weak evidence
-at most, and the cause is not established. The calibration maps flip these five, because
-the flip held on the training folds; it is a small effect either way. Fractures in older patients (forearm, clavicle)
-do better, because age predicts them.
+**Acute, one-off events: 0.44–0.71, sixteen conditions.** Sinusitis, sore throat,
+bronchitis, sprains, cuts, whiplash, concussion. Age scores only 0.41–0.66 on them and
+death 0.43–0.57, and they are as common in patients who die as in those who don't (viral
+sinusitis 44.1% against 45.5%). Nothing in the history predicts them, so no model can rank
+them. Five score slightly below 0.5; with sixteen conditions all near chance, some are
+expected to. Fractures in older patients (forearm, clavicle) do better, because age
+predicts them.
 
-**Why macro AP is low.** AP depends on prevalence, and most of these conditions are rare:
-median prevalence among at-risk patients is 3.3%, while the most common, viral sinusitis,
-is 45%. Lift over prevalence is a fairer comparison. It is 16–27× for the prostate trio
-and 0.8–1.4× for the acute events.
+**Why mAP (0.24) is much lower than AUROC (0.78).** The two measure different things.
+AUROC asks whether patients who get the condition are ranked above those who don't. AP asks
+how many of the patients ranked near the top really get it, so it punishes false alarms,
+and false alarms are unavoidable when a condition is rare. Most of these conditions are
+rare: the typical one is newly diagnosed in 3.3% of patients, so a model that ranks at
+random scores about 0.03 AP on it. An AP of 0.24 averaged over the 40 conditions is well
+above that, even though it looks low next to the AUROC.
 
-**Two caveats on the macro average.** Several labels are near duplicates. Abnormal gait
-and silent micro-haemorrhage of the brain have the same 41 positives (φ = 1.000), and the
-lung-cancer trio correlates at 0.94–0.99. So there are about 35 independent problems, not
-40. And Synthea is not real EHR data: a classifier separates it from MIMIC at AUC 0.999,
-and its diseases follow simple rule-based modules. How easy each condition is here says
-little about how easy it would be in a real hospital.
+These patterns come from how Synthea generates patients, not from real medicine. In real
+records, for example, pneumonia is not confined to patients in their last five years of
+life. So which conditions are easy here says little about which would be easy in a real
+hospital.

@@ -18,7 +18,7 @@ repo root.
 ```powershell
 pip install -r requirements.txt
 python -m pytest -q                                   # tests (~5 min)
-python -m src.cross_validate --max-folds 3            # out-of-fold predictions
+python -m src.cross_validate                         # 5-fold out-of-fold predictions
 python -m src.calibrate --fit oof --model ens_lr_gbdt_tx --oof-model lr+gbdt+transformer
 python -m src.run_baseline --with-transformer --recipe ens_lr_gbdt_tx   # -> predictions.csv
 ```
@@ -57,6 +57,18 @@ the validation set was used for early stopping and monitoring.
 | `src/run_baseline.py`, `src/predict.py` | final fit and `predictions.csv` |
 | `src/tx_sweep.py` | the transformer experiments reported in section 2 |
 | `src/hf_upload.py`, `src/log_shipped_run.py` | Hugging Face upload; wandb-logged refit |
+
+## Something I realised later
+
+Common lab values are fused into one token per lab and decile, for example `OBS_8480-6_Q7`
+for systolic blood pressure in its 7th decile. Each of those tokens gets its own embedding,
+so the model is not told that `Q7` and `Q8` of the same lab are neighbouring values, or even
+that they are the same lab; it has to learn that separately for every decile. Splitting
+them into two tokens (`OBS_8480-6` followed by `Q7`) would not fix this in a one-layer
+model, because the prediction position reads every token independently and a lone `Q7`
+would not know which lab it belongs to. The fix I would try is to keep one token per lab
+reading but build its embedding as `embedding(lab) + embedding(decile)`, so the deciles of
+one lab share the lab part. This was not tested.
 
 Experiment tracking is opt-in (`$env:WANDB=1`); every run also logs to
 `outputs/metrics.jsonl`.

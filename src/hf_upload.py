@@ -37,8 +37,7 @@ Predicts which of 40 target conditions are **newly** diagnosed in the five
 years after a patient's anchor date, from structured Synthea EHR events
 recorded strictly before it.
 
-Trained for the M31 research-intern take-home. **Synthetic data only. Not a
-clinical device, and not usable for any decision about a real person.**
+Trained for the M31 research-intern take-home, on synthetic data only.
 
 ## Model
 
@@ -97,21 +96,54 @@ shift. Every fitted statistic — vocabulary, quantile edges, scalers — is fit
 on training patients only. 152 automated checks cover this, including a grep
 test that no module outside the time utility parses a timestamp.
 
-## Limitations
+## Reproducing the predictions
 
-Synthea is not real EHR data. A discriminator separates it from MIMIC at
-AUC 0.999, and across 19 health datasets the winning classifier agreed between
-real- and synthetic-trained models in only 21–26% of cases. **Whichever model
-wins here, that ranking should not be assumed to transfer.**
+The files on this page are enough to rebuild the submitted `predictions.csv`
+exactly, without any training. The patient data is not included here: you need
+the dataset provided with the M31 take-home.
 
-## Reproducing
+**You need** Python 3.13, git, and that dataset.
 
-```bash
-git clone https://github.com/Sallamsaka/M31-Coding-Test && cd M31-Coding-Test
-pip install -r requirements.txt
-# put the provided data (train_val/, test/, the three CSVs) in the repo root, then:
-python -m src.reproduce --from-hub sallamsaka/M31-Coding-Test   # predictions from these files, no training
-```
+1. Get the code and install its dependencies:
+
+   ```
+   git clone https://github.com/Sallamsaka/M31-Coding-Test
+   cd M31-Coding-Test
+   pip install -r requirements.txt
+   ```
+
+2. Copy the provided data into that folder, so that it looks like this:
+
+   ```
+   M31-Coding-Test/
+     train_val/              provided CSV tables, train and validation patients
+     test/                   provided CSV tables, test patients
+     patient_splits.csv
+     target_conditions.csv
+     test_anchors.csv
+     src/, outputs/, ...     already there from the clone
+   ```
+
+3. Run:
+
+   ```
+   python -m src.reproduce --from-hub sallamsaka/M31-Coding-Test
+   ```
+
+   This downloads the model files from this page, builds each test patient's
+   features and event sequence, runs logistic regression, the boosted trees and
+   the three transformer seeds, averages and calibrates them, and writes
+   `outputs/predictions_reproduced.csv` (358 patients, 40 conditions).
+
+4. Check the last line it prints. The clone already contains the submitted
+   `outputs/predictions.csv`, and the script compares against it:
+
+   ```
+   max |reproduced - outputs/predictions.csv| = 7.40e-08  (MATCH)
+   ```
+
+   Anything below 1e-5 prints `MATCH`; the remaining difference is floating-point
+   rounding.
 
 Retraining everything from scratch is described in the GitHub README.
 """

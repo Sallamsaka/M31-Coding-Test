@@ -63,7 +63,9 @@ rather than in a separate position makes sequences 37% shorter (median 259 token
 
 Text-valued answers (smoking status, the urinalysis panel) are kept as the code alone. I
 tested adding the answer, and also fusing every lab into its token. Neither made a
-measurable difference (§2).
+measurable difference (§2). In hindsight, each lab-and-decile token has its own embedding,
+so neighbouring deciles of the same lab share nothing; building the embedding as
+`embedding(lab) + embedding(decile)` would fix that (not tested).
 
 ### Time: two encodings per event
 

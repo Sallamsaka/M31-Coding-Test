@@ -36,7 +36,7 @@ def git_provenance() -> dict[str, Any]:
     """``{"git": "<sha>", "git_dirty": bool}``, best-effort and never fatal.
 
     Every recorded metric should be traceable to the code that produced it.
-    Without this the 60+ measured numbers in SESSION-KNOWLEDGE cannot be tied
+    Without this the measured numbers cannot be tied
     to a revision, which is the difference between a result and an anecdote.
 
     **The dirty flag is the part that matters.** A bare SHA recorded from a
